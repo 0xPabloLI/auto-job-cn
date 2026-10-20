@@ -1,0 +1,31 @@
+# 依赖声明（deptry 数据源）与工具配置锚点。pip 安装仍走 requirements*.txt（== 固定）。
+[project]
+name = "auto-job-cn"
+version = "0.1.0"
+description = "求职自动化投简历流水线（Camoufox 实时浏览投递 + 回复率追踪 + KB 记忆回写）"
+requires-python = ">=3.9"
+dependencies = [
+    "camoufox==0.5.5",
+    "lxml==6.1.2",
+    "pdfplumber==0.11.10",
+]
+
+[dependency-groups]
+dev = [
+    "pytest==9.1.1",
+    "pytest-cov==7.1.0",
+    "pytest-xdist==3.8.0",
+    "ruff==0.16.7",
+    "mypy==2.3.1",
+    "vulture==2.16",
+    "deptry==0.25.1",
+]
+
+[tool.deptry]
+# 本地未入库的实验脚本目录一并排除（gitignored）
+exclude = ["^oneshot/", "__pycache__"]
+
+[tool.deptry.per_rule_ignores]
+# pytest 是 dev 依赖，test_*.py 按设计 import（脚本仓无包结构，DEP001/DEP004 均豁免 pytest）。
+DEP001 = ["pytest"]
+DEP004 = ["pytest"]

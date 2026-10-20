@@ -1,0 +1,1660 @@
+#!/usr/bin/env python3
+"""platforms 包的行为测试：抽象接口、工厂/配置、平台解析纯函数、stub 平台、
+#56 A3 的细颗粒节拍（beat_fn 注入点）。"""
+
+import random
+import sys
+from pathlib import Path
+
+import pytest
+
+SCRIPTS = Path(__file__).resolve().parent
+sys.path.insert(0, str(SCRIPTS))
+
+import platforms
+from platforms import PlatformBase
+from platforms import chat_first as chat_mod
+
+# #56 取证 A：注册表/计数状态归 `_forensics` 所有，读数与复位都打在**本体**上——
+# patch 或读 `chat_mod` 顶部那几个别名只会拿到导入时的快照（静默 no-op，本仓有专门钉它的用例）。
+import _forensics as fx  # noqa: E402
+
+
+# --- 抽象接口与工厂 ---
+
+
+def test_base_is_abstract():
+    with pytest.raises(TypeError):
+        PlatformBase()
+
+
+def test_get_platform_chat_first():
+    p = platforms.get_platform("chat-first")
+    assert isinstance(p, PlatformBase)
+    assert p.name == "chat-first"
+    assert "boss-login-dialog" in p.login_dialog_selector
+
+
+def test_get_platform_unknown_raises():
+    with pytest.raises(ValueError):
+        platforms.get_platform("linkedin")
+
+
+def test_get_platform_name_env_override():
+    assert platforms.get_platform_name(env={"PLATFORM": " Lagou "}) == "lagou"
+
+
+def test_get_platform_name_config_file(tmp_path):
+    cfg = tmp_path / "platform.json"
+    cfg.write_text('{"platform": "liepin"}', encoding="utf-8")
+    assert platforms.get_platform_name(env={}, config_path=str(cfg)) == "liepin"
+    assert platforms.get_platform_name(env={"PLATFORM": "chat-first"}, config_path=str(cfg)) == "chat-first"
+
+
+def test_get_platform_name_defaults():
+    assert platforms.get_platform_name(env={}, config_path="/nonexistent/platform.json") == "chat-first"
+
+
+# --- 拉勾/猎聘：接口占位，未实现 ---
+
+
+@pytest.mark.parametrize("name", ["lagou", "liepin"])
+def test_stub_platforms_not_implemented(name):
+    p = platforms.get_platform(name)
+    assert isinstance(p, PlatformBase)
+    with pytest.raises(NotImplementedError):
+        p.crawl_jds(None, [], 0, set())
+    with pytest.raises(NotImplementedError):
+        p.apply(None, {}, "x")
+    with pytest.raises(NotImplementedError):
+        p.followup(None, [])
+
+
+# --- ChatFirstPlatform 纯函数：followup 对话解析（#30 修复：字段来源从整卡 innerText 猜行
+# --- 改为 wapi 结构化直取 + 结构化 DOM 降级；fixture 为 2026-09-12 真实登录探针 dump，
+# --- 见 内部调研笔记（未随本仓分发）。旧合成串 fixture 与解析器假设同源，已废。） ---
+
+PLATFORM = platforms.get_platform("chat-first")
+
+# wapi getGeekFriendList.json 条目（真实响应节选，仅裁剪 securityId/avatar 等无关长字段）
+WAPI_MINE_READ = {  # 我方最后发言且对方已读——旧解析把这条误判成 hr_replied（[已读]≠回复）
+    "name": "严先生",
+    "brandName": "煦珩人力",
+    "title": "猎头顾问",
+    "lastMsg": "严先生你好，我有7年Solidity智能合约开发经验，深耕DeFi衍生品协议设计。",
+    "lastTime": "昨天",
+    "lastTS": 1789097252186,
+    "lastMessageInfo": {"fromId": 780045835, "toId": 626134785, "status": 2, "msgTime": 1789097252186},
+    "encryptJobId": "45167fe4a07eec100nF93Ni1EVBQ",
+}
+WAPI_MINE_DELIVERED = {  # 我方最后发言未读（[送达]）
+    "name": "邝强",
+    "brandName": "上海布沁网络科技",
+    "title": "集团人力资源主管",
+    "lastMsg": "李总您好，我有7年Web3全栈经验，RWA 和稳定币方向我有一手研究。",
+    "lastTime": "昨天",
+    "lastTS": 1789092602966,
+    "lastMessageInfo": {"fromId": 780045835, "toId": 27243113, "status": 1, "msgTime": 1789092602966},
+    "encryptJobId": "40cde3336736a7a30nF93Ni1EVBQ",
+}
+WAPI_HR_REPLY = {  # HR 最后发言（真实回复文本）
+    "name": "潘女士",
+    "brandName": "煦辰",
+    "title": "招聘者",
+    "lastMsg": "对你的简历很感兴趣，期待深入交流。",
+    "lastTime": "09月09日",
+    "lastTS": 1788931229176,
+    "lastMessageInfo": {"fromId": 740868320, "toId": 780045835, "status": 0, "msgTime": 1788931229176},
+    "encryptJobId": "187886fb6ba7eff90nJ_3ti7",
+}
+
+# 结构化 DOM 卡片（真实 dump：li[role=listitem] 下的 .time/.name-text/.message-status/.last-msg-text）
+DOM_CHIP = {  # 带状态徽标 = 我方最后发言
+    "time": "昨天",
+    "name": "严先生",
+    "name_box": "严先生煦珩人力猎头顾问",
+    "status": "[已读]",
+    "status_read": True,
+    "last_msg": "严先生你好，我有7年Solidity智能合约开发经验，深耕DeFi衍生品协议设计。",
+}
+DOM_NO_CHIP = {  # 无徽标 = HR 最后发言
+    "time": "09月09日",
+    "name": "潘女士",
+    "name_box": "潘女士煦辰招聘者",
+    "status": None,
+    "status_read": False,
+    "last_msg": "对你的简历很感兴趣，期待深入交流。",
+}
+DOM_NO_CHIP_2 = {  # 无徽标，品牌 4 字（match_brand min_len 下限之上，可回填）
+    "time": "09月08日",
+    "name": "汤女士",
+    "name_box": "汤女士昀洵网络人事专员",
+    "status": None,
+    "status_read": False,
+    "last_msg": "简历已收到，合适会联系您[抱拳]",
+}
+
+
+def test_parse_friend_entries_field_mapping_and_compat_company():
+    out = chat_mod.parse_friend_entries([WAPI_MINE_READ], my_user_id=780045835)
+    c = out[0]
+    assert c["name"] == "严先生", "name 是联系人，不再是时间样式（#30 验收 1）"
+    assert c["company"] == "严先生煦珩人力猎头顾问", "company 沿用旧粘连语义（reply_annotations 匹配键不变）"
+    assert c["brandName"] == "煦珩人力"
+    assert c["title"] == "猎头顾问"
+    assert c["summary"].startswith("严先生你好")
+    assert c["time"].startswith("2026-09-11"), "time 是真实时间戳，不再是消息正文（#30 验收 2）"
+    assert c["lastTime"] == "昨天"
+    assert c["encryptJobId"] == "45167fe4a07eec100nF93Ni1EVBQ"
+    assert c["source"] == "wapi"
+
+
+def test_parse_friend_entries_read_is_not_reply():
+    out = chat_mod.parse_friend_entries([WAPI_MINE_READ, WAPI_MINE_DELIVERED, WAPI_HR_REPLY], my_user_id=780045835)
+    mine_read, mine_sent, hr = out
+    assert mine_read["status"] == "awaiting", "[已读] 绝不算回复，归 awaiting（#30 开放问题裁决）"
+    assert mine_read["is_read"] is True, "已读标记保留供独立分析"
+    assert mine_sent["status"] == "awaiting" and mine_sent["is_read"] is False
+    assert hr["status"] == "hr_replied" and hr["is_read"] is False
+
+
+def test_parse_friend_entries_status_fallback_without_uid():
+    # userId 不可用时按 lastMessageInfo.status 兜底：0=对方消息，1/2=我方消息
+    assert chat_mod.parse_friend_entries([WAPI_HR_REPLY], my_user_id=None)[0]["status"] == "hr_replied"
+    assert chat_mod.parse_friend_entries([WAPI_MINE_DELIVERED], my_user_id=None)[0]["status"] == "awaiting"
+
+
+def test_parse_friend_entries_missing_message_info_is_awaiting():
+    """2026-09-24 修复：lastMessageInfo 整体缺失（wapi 未 hydrate，实测 3 条）⇒ 无「对方
+    回复」证据，保守归 awaiting——旧逻辑空体默认 False → hr_replied，假阳性污染 replied 统计。"""
+    no_payload = {
+        "name": "吕女士",
+        "brandName": "煦昱金创",
+        "title": "HRBP",
+        "encryptJobId": "eid1",
+        "lastMsg": None,
+        "lastMessageInfo": None,
+    }
+    out = chat_mod.parse_friend_entries([no_payload], my_user_id=780045835)
+    assert out[0]["status"] == "awaiting"
+    assert out[0]["lastMsg"] == ""
+    # my_user_id 不可用路径同样保守
+    assert chat_mod.parse_friend_entries([no_payload], my_user_id=None)[0]["status"] == "awaiting"
+
+
+def test_parse_friend_entries_applied_job_by_eid():
+    applied = [{"encryptJobId": WAPI_HR_REPLY["encryptJobId"], "jobName": "AI产品经理", "brandName": "别的公司"}]
+    out = chat_mod.parse_friend_entries([WAPI_HR_REPLY], my_user_id=780045835, applied=applied)
+    assert out[0]["appliedJob"] == "AI产品经理", "encryptJobId 精确回查优先于品牌匹配"
+
+
+def test_parse_dom_cards_semantics():
+    out = chat_mod.parse_dom_cards([DOM_CHIP, DOM_NO_CHIP], applied=[])
+    mine, hr = out
+    assert mine["status"] == "awaiting" and mine["is_read"] is True
+    assert mine["company"] == "严先生煦珩人力猎头顾问"
+    assert mine["name"] == "严先生"
+    assert mine["time"] == "昨天", "DOM 路径只有展示串时间"
+    assert mine["source"] == "dom"
+    assert hr["status"] == "hr_replied" and hr["is_read"] is False
+    assert hr["summary"].startswith("对你的简历很感兴趣")
+    assert hr["appliedJob"] is None, "无 applied 或品牌多义时不回填"
+
+
+def test_parse_dom_cards_unique_brand_match_backfills_job():
+    applied = [{"brandName": "昀洵网络", "jobName": "Web3安全工程师", "encryptJobId": "e1"}]
+    out = chat_mod.parse_dom_cards([DOM_NO_CHIP_2], applied=applied)
+    assert out[0]["appliedJob"] == "Web3安全工程师"
+    assert out[0]["encryptJobId"] == "e1"
+
+
+class _FakeResp:
+    def __init__(self, url, body):
+        self.url = url
+        self._b = body
+
+    def json(self):
+        return self._b
+
+
+class _FakeChatPage:
+    """followup 编排测试替身：response 监听注册后由 goto 派发（模拟事件到达）。"""
+
+    def __init__(self, wapi=True, login_selector_hit=False, url="https://www.zhipin.com/web/geek/chat", title="消息"):
+        self.handlers = {}
+        self.evaluated = []
+        self._wapi = wapi
+        self._login = login_selector_hit
+        self.url = url
+        self._title = title
+
+    def title(self):
+        return self._title
+
+    def on(self, ev, h):
+        self.handlers.setdefault(ev, []).append(h)
+
+    def goto(self, url, **kw):
+        if not self._wapi:
+            return
+        for h in self.handlers.get("response", []):
+            h(
+                _FakeResp(
+                    "https://www.zhipin.com/wapi/zpuser/wap/getUserInfo.json",
+                    {"code": 0, "zpData": {"userId": 780045835}},
+                )
+            )
+            h(
+                _FakeResp(
+                    "https://www.zhipin.com/wapi/zprelation/friend/getGeekFriendList.json",
+                    {"code": 0, "zpData": {"result": [WAPI_MINE_READ]}},
+                )
+            )
+
+    def query_selector(self, sel):
+        return True if self._login else None
+
+    def evaluate(self, js):
+        self.evaluated.append(js)
+        return [DOM_CHIP, DOM_NO_CHIP]
+
+    def wait_for_timeout(self, ms):
+        pass
+
+
+# --- 整页登录变体的判据（2026-10-20 实测：掉登录时导到 /web/user/，无 #login-dialog 元素）---
+
+
+class _PageStub:
+    def __init__(self, url="https://www.zhipin.com/web/geek/jobs", title="上海招聘", dialog=False):
+        self.url = url
+        self._title = title
+        self._dialog = dialog
+
+    def title(self):
+        return self._title
+
+    def query_selector(self, sel):
+        return object() if self._dialog else None
+
+
+def test_is_logged_out_three_signals():
+    """三条并判：弹窗 / 整页登录 URL / 标题「注册登录」。任一命中即判掉登录。"""
+    assert chat_mod.is_logged_out(_PageStub(url="https://www.zhipin.com/web/user/"))
+    assert chat_mod.is_logged_out(_PageStub(title="【BOSS直聘注册登录】boss直聘在线注册登录-BOSS直聘"))
+    assert chat_mod.is_logged_out(_PageStub(dialog=True))
+    assert not chat_mod.is_logged_out(_PageStub())
+
+
+def test_is_logged_out_survives_unreadable_page():
+    """页面属性读不到时不误判成「登录过期」（只保留弹窗判据）。"""
+
+    class _Broken:
+        def query_selector(self, sel):
+            return None
+
+    assert not chat_mod.is_logged_out(_Broken())
+
+
+def test_followup_returns_none_on_full_page_login(monkeypatch, capsys):
+    """整页登录（无弹窗元素）必须判成掉登录并返回 None——否则上层会把未登录
+    当成「采到 0 条对话」走残缺降级（2026-10-20 实测形态）。"""
+    monkeypatch.setattr(chat_mod.time, "sleep", lambda *_: None)
+    page = _FakeChatPage(wapi=False, url="https://www.zhipin.com/web/user/", title="【BOSS直聘注册登录】")
+    assert chat_mod.ChatFirstPlatform().followup(page, applied=[]) is None
+    assert "登录态过期" in capsys.readouterr().out
+
+
+def test_followup_prefers_wapi_interception(monkeypatch):
+    monkeypatch.setattr(chat_mod.time, "sleep", lambda *_: None)
+    page = _FakeChatPage()
+    report = chat_mod.ChatFirstPlatform().followup(page, applied=[])
+    assert report["totalConversations"] == 1
+    conv = report["conversations"][0]
+    assert conv["source"] == "wapi"
+    assert conv["status"] == "awaiting" and conv["is_read"] is True
+    assert not page.evaluated, "wapi 命中时不走 DOM evaluate"
+
+
+def test_followup_falls_back_to_structured_dom(monkeypatch):
+    monkeypatch.setattr(chat_mod.time, "sleep", lambda *_: None)
+    page = _FakeChatPage(wapi=False)
+    report = chat_mod.ChatFirstPlatform().followup(page, applied=[])
+    assert report["totalConversations"] == 2
+    assert [c["source"] for c in report["conversations"]] == ["dom", "dom"]
+    assert page.evaluated, "wapi 未命中时降级 DOM evaluate"
+
+
+# --- #59 轮询出口：wapi 响应**可能**分批到达（实测形态是一次调用返回全量，见
+#     内部调研笔记（未随本仓分发） §3），「第一个非空响应」会照单全收首屏 ---
+
+
+FRIEND_LIST_URL = "https://www.zhipin.com/wapi/zprelation/friend/getGeekFriendList.json"
+
+
+def _friend_batch(n, tag="司"):
+    """n 条 wapi 会话条目（字段形态够 parse_friend_entries 计数即可，不测解析）。"""
+    return [dict(WAPI_MINE_READ, name=f"{tag}{i}", brandName=f"{tag}公司{i}") for i in range(n)]
+
+
+class _FakeIncrementalChatPage:
+    """分批到达替身：goto 派发首批（first_batch=None 表示 wapi 整场没响应），其后每次
+    wait_for_timeout 派发脚本队列的下一批。**这是对到达时序的防御性建模，不是站点实测结论**：
+    实测到的是「一次调用返回全部」（各批互为超集），桩序列覆盖的是「后批在等待节拍上到达」这一
+    形态；若站点改为增量分页（批间互不包含），本文件的「取最大批」断言就不再证明拿全。"""
+
+    def __init__(self, first_batch, later_batches=()):
+        self.handlers = {}
+        self._first = None if first_batch is None else list(first_batch)
+        self._queue = [list(b) for b in later_batches]
+        self.waits = 0
+        self.evaluated = []
+
+    def on(self, ev, h):
+        self.handlers.setdefault(ev, []).append(h)
+
+    def _dispatch(self, batch):
+        for h in self.handlers.get("response", []):
+            h(_FakeResp(FRIEND_LIST_URL, {"code": 0, "zpData": {"result": batch}}))
+
+    def goto(self, url, **kw):
+        if self._first is not None:
+            self._dispatch(self._first)
+
+    def query_selector(self, sel):
+        return None
+
+    def evaluate(self, js):
+        self.evaluated.append(js)
+        return []
+
+    def wait_for_timeout(self, ms):
+        self.waits += 1
+        if self._queue:
+            self._dispatch(self._queue.pop(0))
+
+
+def test_followup_returns_largest_batch_on_incremental_arrival(monkeypatch):
+    """#59 验收 3：首屏 3 条、随后两批各 50 条 ⇒ 返回 50 条（旧出口在第一个非空响应即
+    返回，取到 3 条——20260929-202514 实测 3/100 覆盖掉全量报告的竞态形态）。不钉等待拍数：
+    那是实现细节，契约是「拿到的是最 full 的那一批」。"""
+    monkeypatch.setattr(chat_mod.time, "sleep", lambda *_: None)
+    page = _FakeIncrementalChatPage(_friend_batch(3), [_friend_batch(50), _friend_batch(50)])
+    report = chat_mod.ChatFirstPlatform().followup(page, applied=[])
+    assert report["totalConversations"] == 50
+
+
+def test_followup_returns_largest_batch_when_arrivals_shrink(monkeypatch):
+    """递减形态 100 → 3 → 3 ⇒ 返回 **100**（双轴评审的反例：上一版「条数连续两轮不变即
+    返回」在这里返回 3，比旧实现「第一个非空即返回」更差——取最大批而不是最后一次读数）。"""
+    monkeypatch.setattr(chat_mod.time, "sleep", lambda *_: None)
+    page = _FakeIncrementalChatPage(
+        _friend_batch(100, tag="大"), [_friend_batch(3, tag="小"), _friend_batch(3, tag="小")]
+    )
+    report = chat_mod.ChatFirstPlatform().followup(page, applied=[])
+    assert report["totalConversations"] == 100
+
+
+def test_followup_single_batch_still_scans_full_window(monkeypatch):
+    """只来一轮 50 条 ⇒ 仍返回 50：扫满窗口是改判据的固定代价（≈15s），不因「看起来已稳定」
+    提前定稿——提前定稿正是上一版被证伪的那条。"""
+    monkeypatch.setattr(chat_mod.time, "sleep", lambda *_: None)
+    page = _FakeIncrementalChatPage(_friend_batch(50))
+    report = chat_mod.ChatFirstPlatform().followup(page, applied=[])
+    assert report["totalConversations"] == 50
+    assert page.waits == 50, "扫满窗口是固定代价（真实语义：等满才定稿）"
+
+
+def test_followup_empty_batch_hit_falls_back_to_dom_after_full_window(monkeypatch):
+    """命中但整场都是空批（code=0 而 result 为空）⇒ 与「wapi 整场没命中」同一条路：
+    扫满 50 轮后走 DOM 降级，不把空批当成「拿到数据」就地定稿。"""
+    monkeypatch.setattr(chat_mod.time, "sleep", lambda *_: None)
+    page = _FakeIncrementalChatPage([], [[]])
+    report = chat_mod.ChatFirstPlatform().followup(page, applied=[])
+    assert page.waits == 50, "空批也在扫满窗口之后才降级"
+    assert page.evaluated, "空批降级 DOM evaluate"
+    assert report["totalConversations"] == 0
+
+
+def test_followup_wapi_miss_still_waits_full_rounds_for_dom(monkeypatch):
+    """wapi 整场没响应 ⇒ 仍等满 50 轮再降级 DOM（与空批降级同一条路，两者等待时长一致）。"""
+    monkeypatch.setattr(chat_mod.time, "sleep", lambda *_: None)
+    page = _FakeIncrementalChatPage(None)
+    report = chat_mod.ChatFirstPlatform().followup(page, applied=[])
+    assert page.waits == 50, "无捕获与空批一样：扫满窗口才降级"
+    assert page.evaluated, "wapi 未命中时降级 DOM evaluate"
+    assert report["totalConversations"] == 0
+
+
+def test_followup_beats_land_around_goto_and_on_every_poll_round(monkeypatch):
+    """#59 修复轮 R4-1（平台层侧）：注入 beat_fn 后 goto 前后各一拍、轮询每一轮一拍——
+    「聊天页加载慢」不再等于「无心跳」。label 用 `followup:wait-friends:{n}` 一族，与
+    `search:wait-xhr:{n}` / `jd:dom-poll:{n}:*` 同族同风格（轮次进 label，停在第几轮读得出来）。"""
+    monkeypatch.setattr(chat_mod.time, "sleep", lambda *_: None)
+    beats = []
+    page = _FakeIncrementalChatPage(_friend_batch(2))
+    report = chat_mod.ChatFirstPlatform().followup(page, applied=[], beat_fn=beats.append)
+    assert report["totalConversations"] == 2, "拍点是观测旁路，采集语义一字不动"
+    assert beats[:2] == ["followup:goto-chat:pre", "followup:goto-chat:post"]
+    assert beats[2:] == [f"followup:wait-friends:{i}" for i in range(1, chat_mod.FRIEND_POLL_ROUNDS + 1)]
+
+
+def test_followup_waits_come_from_the_pinned_constants(monkeypatch):
+    """本段等待的**来源**必须是那四个模块常量，而不是散在函数体里的字面量——阈值护栏用例
+    `test_followup_chat_page_silence_ceiling_sits_below_both_thresholds` 读的就是这些名字，
+    有人把 goto 的 timeout 改回内联数字时，护栏就变成读空气（这条先红）。"""
+    slept = []
+    monkeypatch.setattr(chat_mod.time, "sleep", lambda s, *_: slept.append(s))
+
+    class _ProbePage(_FakeIncrementalChatPage):
+        """记录真实调用参数的页面替身：goto 的 timeout、每轮 wait 的毫秒数。"""
+
+        def __init__(self):
+            super().__init__(_friend_batch(1))
+            self.goto_timeouts = []
+            self.wait_ms = []
+
+        def goto(self, url, **kw):
+            self.goto_timeouts.append(kw.get("timeout"))
+            super().goto(url, **kw)
+
+        def wait_for_timeout(self, ms):
+            self.wait_ms.append(ms)
+            super().wait_for_timeout(ms)
+
+    page = _ProbePage()
+    chat_mod.ChatFirstPlatform().followup(page, applied=[])
+    assert page.goto_timeouts == [chat_mod.CHAT_GOTO_TIMEOUT_MS]
+    assert slept == [chat_mod.FOLLOWUP_POST_GOTO_SLEEP_SECONDS]
+    assert page.wait_ms == [chat_mod.FRIEND_POLL_INTERVAL_MS] * chat_mod.FRIEND_POLL_ROUNDS
+
+
+# --- #56 取证 A（平台层侧）：`followup` 的 handler 与两次取体进同一份往返计数 ---
+
+
+def test_resp_json_with_forensics_reads_body_once_and_balances_the_counter():
+    """包装体本身：`resp.json()` **只求值一次**（多一次取体=多一次无超时往返=多一次楔死机会，
+    与 `live_apply.capture_xhr` 那条 R3 铁律同源），且 enter/exit 在异常路径上也平衡——
+    计数漂了就等于把「下一次卡死」的读数提前作废。"""
+    fx._reset_handler_forensics()
+
+    class _Counting:
+        def __init__(self):
+            self.calls = 0
+
+        def json(self):
+            self.calls += 1
+            if self.calls > 1:
+                raise RuntimeError("第二次求值不该发生")
+            return {"code": 0}
+
+    resp = _Counting()
+    assert chat_mod._resp_json_with_forensics(resp, chat_mod.FRIEND_LIST_URL_FRAG) == {"code": 0}
+    assert resp.calls == 1, "取体只求值一次（enter/exit 包的是同一条语句）"
+    assert fx.handler_forensics() == {
+        "handlers_live": 0,
+        "handlers_inflight": 0,
+        "handler_last_frag": chat_mod.FRIEND_LIST_URL_FRAG,
+    }
+
+    class _Boom:
+        def json(self):
+            raise RuntimeError("Timeout 30000ms exceeded while reading response body")
+
+    # 异常**照原样外抛**：`followup` 那个 `except Exception: pass` 的口径不许被包装体改掉
+    with pytest.raises(RuntimeError):
+        chat_mod._resp_json_with_forensics(_Boom(), chat_mod.USER_INFO_URL_FRAG)
+    assert fx.handler_forensics()["handlers_inflight"] == 0, "finally 保证配对，异常路径也一样平衡"
+
+
+def test_followup_registers_its_response_handler(monkeypatch):
+    """接线证明：`page.on("response", h)` 之后 handler 进了注册表，两次派发（user/info 与
+    friend/list）各留下一对 enter/exit、收尾平衡。
+    **本 handler 没有注销点**（followup 走会话末尾的聊天页，页面随后整体关闭），所以这一项
+    会一直留在 `handlers_live` 里——判读时记得收尾之后的读数天然偏高 1，它不是逐岗泄漏
+    （出处见 `chat_first.py` 里 `listener_attached(h)` 那条注释）。"""
+    fx._reset_handler_forensics()
+    monkeypatch.setattr(chat_mod.time, "sleep", lambda *_: None)
+    page = _FakeChatPage()
+    report = chat_mod.ChatFirstPlatform().followup(page, applied=[])
+    assert report["totalConversations"] == 1, "取证接线不改采集语义"
+    reading = fx.handler_forensics()
+    assert reading["handlers_live"] == 1, reading
+    assert reading["handlers_inflight"] == 0, reading
+    # `_FakeChatPage.goto` 先派 user/info、后派 friend/list ⇒ 最后进入的那次往返是 friend list
+    assert reading["handler_last_frag"] == chat_mod.FRIEND_LIST_URL_FRAG, reading
+
+
+def test_build_report_counts():
+    results = [
+        {"status": "hr_replied", "appliedJob": "A"},
+        {"status": "awaiting", "appliedJob": "A"},
+        {"status": "hr_replied", "appliedJob": None},
+        {"status": "awaiting", "appliedJob": None},
+    ]
+    report = chat_mod.build_report(results, generated_at="2026-09-06 12:00:00")
+    assert report["totalConversations"] == 4
+    assert report["hrReplied"] == 2
+    assert report["awaiting"] == 2
+    assert report["replyRate"] == "50%"
+    assert report["linkedToApplied"] == 2
+    assert report["linkedReplied"] == 1
+    # 入站线索读数（2026-10-16）：未关联＝归不到我们的投递记录；其中末条是对方发言＝在等回话
+    assert report["unlinkedConversations"] == 2
+    assert report["unlinkedReplied"] == 1
+    assert report["generatedAt"] == "2026-09-06 12:00:00"
+
+
+def test_build_report_unlinked_readings_are_always_present():
+    """全关联场景下两键仍恒在（0 也写出来，口径同 #62 no_send_reasons）——旧报告读者按缺键
+    回落，但新报告不许缺键。"""
+    report = chat_mod.build_report([{"status": "awaiting", "appliedJob": "A"}], generated_at="2026-10-16 00:00:00")
+    assert report["unlinkedConversations"] == 0 and report["unlinkedReplied"] == 0
+
+
+# --- ChatFirstPlatform 纯函数：JD 去重收集（自 crawl_jds.py 平移） ---
+
+
+def test_collect_new_jds_dedups_and_excludes():
+    listing = [
+        {"encryptJobId": "1", "jobName": "A"},
+        {"encryptJobId": "2", "jobName": "B"},
+        {"encryptJobId": None, "jobName": "C"},
+        {"encryptJobId": "1", "jobName": "A2"},
+    ]
+    collected = [{"encryptJobId": "2"}]  # 已在本轮收过
+    new = chat_mod.collect_new_jds(listing, collected, applied_ids={"9"})
+    assert [j["encryptJobId"] for j in new] == ["1"], "排除已投递与本轮重复，跳过无 id"
+    collected.extend(new)
+    again = chat_mod.collect_new_jds(listing, collected, applied_ids={"1"})
+    assert again == []
+
+
+# --- issue #20：拟人浏览/打字/风控检测 ---
+
+
+class _Rng:
+    """确定性随机：uniform 取中值、randint 取中值、random 可配、choice 取首项。"""
+
+    def __init__(self, random_val=0.5):
+        self.random_val = random_val
+
+    def uniform(self, lo, hi):
+        return (lo + hi) / 2
+
+    def randint(self, lo, hi):
+        return (lo + hi) // 2
+
+    def random(self):
+        return self.random_val
+
+    def choice(self, seq):
+        return seq[0]
+
+
+class _Keyboard:
+    def __init__(self):
+        self.typed = []
+        self.pressed = []
+
+    def type(self, text, delay=0):
+        self.typed.append(text)
+
+    def press(self, key):
+        self.pressed.append(key)
+
+
+class _Mouse:
+    def __init__(self, wheel_raises=False):
+        self.wheels = []
+        self.clicks = []
+        self._raises = wheel_raises
+
+    def wheel(self, dx, dy):
+        self.wheels.append((dx, dy))
+        if self._raises:
+            raise RuntimeError("boom")
+
+    def click(self, x, y, **kw):
+        self.clicks.append((x, y))
+
+
+class _BoxEl:
+    """coordinate_click 用：只有 bounding_box。"""
+
+    def __init__(self, box):
+        self._box = box
+
+    def bounding_box(self):
+        return self._box
+
+
+class _ViewPage:
+    """coordinate_click 用：evaluate 返回视口尺寸，mouse.click 可记录。"""
+
+    def __init__(self, vw=1280, vh=800):
+        self.mouse = _Mouse()
+        self.evaluated = []
+        self._view = {"w": vw, "h": vh}
+
+    def evaluate(self, js, *args):
+        self.evaluated.append(js)
+        return self._view
+
+
+class _El:
+    def __init__(self, visible=True, click_raises=False):
+        self._visible = visible
+        self._click_raises = click_raises
+
+    def is_visible(self):
+        return self._visible
+
+    def click(self, **kw):
+        if self._click_raises:
+            raise RuntimeError("click timeout")
+
+
+class _FakePage:
+    """最小 page 替身：query_selector 按映射返回；记录 goto/evaluate/keyboard/mouse。"""
+
+    def __init__(self, sel_map=None, evaluate_raises=False):
+        self.keyboard = _Keyboard()
+        self.mouse = _Mouse()
+        self._sel = sel_map or {}
+        self.gotos = []
+        self.went_back = False
+        self.evaluated = []
+        self._evaluate_raises = evaluate_raises
+
+    def query_selector(self, sel):
+        return self._sel.get(sel)
+
+    def evaluate(self, js, *args):
+        self.evaluated.append(js)
+        if self._evaluate_raises:
+            raise RuntimeError("boom")
+
+    def goto(self, url, **kw):
+        self.gotos.append(url)
+
+    def go_back(self, **kw):
+        self.went_back = True
+
+
+def test_detect_risk_signal_selector_hit():
+    page = _FakePage({"[class*='captcha']": _El()})
+    sig = chat_mod.detect_risk_signal(page)
+    assert sig and "风控" in sig
+
+
+def test_detect_risk_signal_text_hit():
+    page = _FakePage({"text=安全验证": _El()})
+    sig = chat_mod.detect_risk_signal(page)
+    assert sig and "安全验证" in sig
+
+
+def test_coordinate_click_hits_center_and_skips_out_of_viewport():
+    """#44：坐标点击打元素中心；视口外一律不点（会误点别处）——交调用方兜底。"""
+    el = _BoxEl({"x": 300, "y": 200, "width": 100, "height": 40})
+    page = _ViewPage()
+    assert chat_mod.coordinate_click(page, el) is True
+    assert page.mouse.clicks == [(350.0, 220.0)], "坐标点击落在元素中心"
+
+    off = _BoxEl({"x": -500, "y": 200, "width": 100, "height": 40})
+    page2 = _ViewPage()
+    assert chat_mod.coordinate_click(page2, off) is False, "视口外宁可不点"
+    assert page2.mouse.clicks == []
+
+
+def test_detect_risk_signal_none_and_hidden_element():
+    assert chat_mod.detect_risk_signal(_FakePage()) is None
+    page = _FakePage({".nc-container": _El(visible=False)})
+    assert chat_mod.detect_risk_signal(page) is None, "隐藏元素不算风控信号"
+
+
+def test_human_read_scrolls_and_swallows_errors(monkeypatch):
+    monkeypatch.setattr(chat_mod.time, "sleep", lambda *_: None)
+    page = _FakePage()
+    chat_mod.human_read(page, lo=0, hi=0, rng=_Rng())  # n_scroll=randint(1,3) 中值=2
+    # #44 反侦察：一段滚动拆 2~4 个小步 ⇒ 2 次滚动 = 4~8 次 evaluate scrollBy（非 wheel）
+    assert 4 <= len(page.evaluated) <= 8, "停留期间 2 次滚动，每次拆 2-4 小步"
+    assert all("scrollBy" in js for js in page.evaluated)
+    bad = _FakePage(evaluate_raises=True)
+    chat_mod.human_read(bad, lo=0, hi=0, rng=_Rng())  # 滚动异常不抛出
+
+
+def test_human_type_char_by_char_no_typo():
+    page = _FakePage()
+    n, typos = chat_mod.human_type(page, "您好", delay_lo=1, delay_hi=2, typo_prob=0.0, rng=_Rng())
+    assert page.keyboard.typed == ["您", "好"], "逐字键入，非整段 fill"
+    assert page.keyboard.pressed == []
+    assert (n, typos) == (2, 0)
+
+
+def test_human_type_typo_then_backspace_once():
+    page = _FakePage()
+    n, typos = chat_mod.human_type(page, "好", delay_lo=1, delay_hi=2, typo_prob=1.0, rng=_Rng(random_val=0.0))
+    assert typos == 1 and n == 1
+    assert page.keyboard.pressed == ["Backspace"], "错字后退格修正"
+    assert page.keyboard.typed[-1] == "好", "退格后补上正确字"
+    assert len(page.keyboard.typed) == 2, "错字 1 次 + 正字 1 次"
+
+
+def test_human_type_typo_at_most_once(monkeypatch):
+    monkeypatch.setattr(chat_mod.time, "sleep", lambda *_: None)
+    page = _FakePage()
+    _, typos = chat_mod.human_type(page, "甲乙丙", typo_prob=1.0, rng=_Rng(random_val=0.0))
+    assert typos == 1, "一条消息最多 1 次错字（避免过度拟真反而显眼）"
+
+
+def test_search_via_input_types_and_enters():
+    page = _FakePage({"input[placeholder*='搜索']": _El()})
+    assert chat_mod.search_via_input(page, "Solidity", rng=_Rng()) is True
+    assert page.keyboard.typed == ["Solidity"]
+    assert page.keyboard.pressed == ["Enter"]
+
+
+def test_search_via_input_no_box_returns_false():
+    assert chat_mod.search_via_input(_FakePage(), "Solidity", rng=_Rng()) is False
+
+
+def test_search_via_input_hidden_box_skips_to_fallback():
+    page = _FakePage({"input[placeholder*='搜索']": _El(visible=False)})
+    assert chat_mod.search_via_input(page, "Solidity", rng=_Rng()) is False
+    assert page.keyboard.typed == [], "隐藏输入框不键入"
+
+
+# --- issue #36：沟通按钮查找（专属 class 优先 + 文本约束回退 + 可见性过滤） ---
+
+
+class _CommEl:
+    """按钮替身：可见性 + inner_text + scroll 记录。"""
+
+    def __init__(self, text="立即沟通", visible=True, scroll_raises=False):
+        self._text = text
+        self._visible = visible
+        self._scroll_raises = scroll_raises
+        self.scrolled = False
+
+    def is_visible(self):
+        return self._visible
+
+    def inner_text(self):
+        return self._text
+
+    def scroll_into_view_if_needed(self, **kw):
+        if self._scroll_raises:
+            raise RuntimeError("scroll timeout")
+        self.scrolled = True
+
+
+class _CommPage:
+    """query_selector / query_selector_all 均按映射返回（值可为 list 或单元素）。"""
+
+    def __init__(self, sel_map=None):
+        self._sel = sel_map or {}
+
+    def query_selector(self, sel):
+        return self._sel.get(sel)
+
+    def query_selector_all(self, sel):
+        v = self._sel.get(sel, [])
+        return v if isinstance(v, list) else [v]
+
+    def evaluate(self, js, *args):
+        # find_comm_button 现走页面内 JS scrollIntoView（#44：Juggler 的
+        # scroll_into_view_if_needed 会无超时挂起，2026-09-24 改）；按真页面语义
+        # 把滚动记到元素上、_scroll_raises 时抛异常（验证不阻断查找）。
+        el = args[0] if args else None
+        if el is None:
+            return None
+        if el._scroll_raises:
+            raise RuntimeError("scroll timeout")
+        el.scrolled = True
+        return None
+
+
+def test_find_comm_button_prefers_startchat_class():
+    btn = _CommEl()
+    page = _CommPage({".job-op .btn-startchat": [btn]})
+    assert chat_mod.find_comm_button(page) is btn
+    assert btn.scrolled, "点击前页面内 JS scrollIntoView 前置（#44：不用 Juggler 版）"
+
+
+def test_find_comm_button_class_wildcard_fallback():
+    btn = _CommEl()
+    page = _CommPage({"[class*='btn-startchat']": [btn]})
+    assert chat_mod.find_comm_button(page) is btn
+
+
+def test_find_comm_button_falls_back_to_button_text():
+    btn = _CommEl()
+    page = _CommPage({"button": [btn], "a.btn": []})
+    assert chat_mod.find_comm_button(page) is btn
+
+
+def test_find_comm_button_skips_hidden_and_continue():
+    cont = _CommEl(text="继续沟通")
+    hidden = _CommEl(visible=False)
+    ok = _CommEl()
+    page = _CommPage({".job-op .btn-startchat": [cont], "button": [hidden, ok]})
+    assert chat_mod.find_comm_button(page) is ok, "「继续沟通」是已投递信号；隐藏按钮不可点"
+
+
+def test_find_comm_button_skips_blank_text_class_hit():
+    blank = _CommEl(text="  \n ")
+    ok = _CommEl()
+    page = _CommPage({".job-op .btn-startchat": [blank], "button": [ok]})
+    assert chat_mod.find_comm_button(page) is ok, "class 命中的空文本节点不可点"
+
+
+def test_find_continue_button_class_constrained():
+    cont = _CommEl()
+    page = _CommPage({"[class*='btn-startchat']:has-text('继续沟通')": cont})
+    assert chat_mod.find_continue_button(page) is cont
+    assert chat_mod.find_continue_button(_CommPage()) is None
+
+
+def test_find_comm_button_scroll_failure_not_blocking():
+    btn = _CommEl(scroll_raises=True)
+    page = _CommPage({".job-op .btn-startchat": [btn]})
+    assert chat_mod.find_comm_button(page) is btn, "滚动失败不阻断查找"
+
+
+def test_find_comm_button_absent_returns_none():
+    assert chat_mod.find_comm_button(_CommPage()) is None
+
+
+# --- #43：save_crash_evidence 三件套落盘（str 路径调 .write_text 曾让 html/url.txt 必失败） ---
+
+
+class _CrashPage:
+    """存证替身：screenshot/content/url 最小面。"""
+
+    def __init__(
+        self,
+        url="https://www.zhipin.com/job_detail/e1.html",
+        content_raises=False,
+        screenshot_raises=False,
+        url_raises=False,
+    ):
+        self._url = url
+        self._content_raises = content_raises
+        self._screenshot_raises = screenshot_raises
+        self._url_raises = url_raises
+
+    @property
+    def url(self):
+        if self._url_raises:
+            raise RuntimeError("target closed")
+        return self._url
+
+    def screenshot(self, **kw):
+        if self._screenshot_raises:
+            raise RuntimeError("screenshot: target closed")
+        Path(kw["path"]).write_bytes(b"png-bytes")
+
+    def content(self):
+        if self._content_raises:
+            raise RuntimeError("content timeout")
+        return "<html><body>崩溃现场</body></html>"
+
+
+def test_save_crash_evidence_writes_all_three_files(tmp_path, monkeypatch):
+    """#43 根因：`(str(prefix) + ".html").write_text(...)` 对 str 调 Path 方法必抛
+    AttributeError 且被吞——crash 目录 11 天 0 个 html/url.txt。修复后三件齐落。"""
+    monkeypatch.setattr(chat_mod, "CRASH_DIR", tmp_path)
+    page = _CrashPage()
+    prefix = chat_mod.save_crash_evidence(page, "no-input", {"brandName": "某基金"})
+    assert prefix is not None
+    for ext in (".png", ".html", ".url.txt"):
+        assert Path(str(prefix) + ext).exists(), f"{ext} 未落盘（#43：html/url.txt 曾必失败）"
+    assert Path(str(prefix) + ".html").read_text(encoding="utf-8") == "<html><body>崩溃现场</body></html>"
+    assert Path(str(prefix) + ".url.txt").read_text(encoding="utf-8") == page.url
+
+
+def test_save_crash_evidence_failure_isolation(tmp_path, monkeypatch):
+    """单件失败不炸整体：content() 抛异常时 PNG/url.txt 照落，且不向调用方抛出
+    （观测层不阻断投递主链路，#43 triage 拍板）。"""
+    monkeypatch.setattr(chat_mod, "CRASH_DIR", tmp_path)
+    page = _CrashPage(content_raises=True)
+    prefix = chat_mod.save_crash_evidence(page, "no-btn", {"brandName": "某基金"})
+    assert prefix is not None
+    assert Path(str(prefix) + ".png").exists()
+    assert Path(str(prefix) + ".url.txt").exists()
+    assert not Path(str(prefix) + ".html").exists()
+
+
+# --- 20260926 实测：浏览器被外部终结时截图/HTML 全失败，日志仍打「现场已存 .png/.html」谎报
+# （#43 red 阶段已观察到该谎报，当时范围只限写盘根因）——消息必须逐件列出实际落盘文件 ---
+
+
+def test_save_crash_evidence_all_failed_reports_truthfully(tmp_path, monkeypatch, capsys):
+    """截图/HTML 全失败、仅 URL 可读：只落 url.txt，消息不得谎报 png/html。"""
+    monkeypatch.setattr(chat_mod, "CRASH_DIR", tmp_path)
+    page = _CrashPage(
+        url="https://www.zhipin.com/job_detail/e1",  # URL 不带 .html，避免污染断言
+        screenshot_raises=True,
+        content_raises=True,
+    )
+    prefix = chat_mod.save_crash_evidence(page, "page_error", {"brandName": "某基金"})
+    out = capsys.readouterr().out
+    assert prefix is not None
+    assert Path(str(prefix) + ".url.txt").exists()
+    assert "现场已存 1 件" in out and ".url.txt" in out
+    assert ".png" not in out and ".html" not in out
+
+
+def test_save_crash_evidence_message_lists_saved_files(tmp_path, monkeypatch, capsys):
+    """成功路径：消息逐件列出实际落盘文件，替代「.png/.html」缩写。"""
+    monkeypatch.setattr(chat_mod, "CRASH_DIR", tmp_path)
+    page = _CrashPage()
+    prefix = chat_mod.save_crash_evidence(page, "no-input", {"brandName": "某基金"})
+    out = capsys.readouterr().out
+    for ext in (".png", ".html", ".url.txt"):
+        assert str(prefix) + ext in out
+
+
+def test_save_crash_evidence_nothing_saved_returns_none(tmp_path, monkeypatch, capsys):
+    """连 URL 都读不出（page.url 抛）：零落盘返回 None，消息如实报未存档。"""
+    monkeypatch.setattr(chat_mod, "CRASH_DIR", tmp_path)
+    page = _CrashPage(screenshot_raises=True, content_raises=True, url_raises=True)
+    assert chat_mod.save_crash_evidence(page, "page_error", {"brandName": "某基金"}) is None
+    out = capsys.readouterr().out
+    assert "未存档" in out
+
+
+# --- #56 A3：细颗粒节拍（beat_fn 注入点，使「停在哪个协议调用」无需栈即可判定）---
+#
+# 票面机制口径 §1：querySelector / querySelectorAll / boundingBox / evaluateExpression /
+# mouse* / keyboard* 在 playwright 1.60 里全是 timeout=None 的裸奔调用。5 场楔死的最后一拍
+# 都停在岗头与 detail-open 之间，答不出停在哪一个调用上——所以这些调用前后各拍一次点，
+# label 里显式写 pre/post：只有 pre = 进了这个调用没出来；pre+post = 出来了，死在下一步。
+# 平台层只收一个可调用的 beat_fn（默认 None = 零行为变更），不知道心跳为何物。
+
+
+class _BeatRecorder:
+    """beat_fn 替身：按顺序记录 label（楔死现场读的正是这个顺序）。"""
+
+    def __init__(self):
+        self.labels = []
+
+    def __call__(self, label):
+        self.labels.append(label)
+
+
+class _BeatMouse:
+    def __init__(self):
+        self.moves = []
+        self.clicks = []
+
+    def move(self, x, y):
+        self.moves.append((x, y))
+
+    def click(self, x, y, **kw):
+        self.clicks.append((x, y))
+
+
+class _BeatPage:
+    """节拍用例的 page 替身：evaluate / wait_for_timeout / mouse 全可观察。
+    `on_wait` 钩子在第 N 次等待时改变条件（模拟详情响应到达），免得测试真等 15s。"""
+
+    def __init__(self, evaluate_seq=None, view=None, on_wait=None):
+        self.mouse = _BeatMouse()
+        self.evaluated = []
+        self.waits = []
+        self._seq = list(evaluate_seq or [])
+        self._view = view if view is not None else {"w": 1280, "h": 800}
+        self._on_wait = on_wait
+
+    def evaluate(self, js, *args):
+        self.evaluated.append(js)
+        return self._seq.pop(0) if self._seq else self._view
+
+    def wait_for_timeout(self, ms):
+        self.waits.append(ms)
+        if self._on_wait:
+            self._on_wait(len(self.waits), ms)
+
+    def query_selector_all(self, sel):
+        return []
+
+
+class _BeatEl:
+    """元素替身：bounding_box 可编排（None = 拿不到几何），click 记录 kwargs。"""
+
+    def __init__(self, box=None, click_raises=False):
+        self._box = box
+        self._click_raises = click_raises
+        self.clicks = []
+
+    def bounding_box(self):
+        return self._box
+
+    def click(self, **kw):
+        self.clicks.append(kw)
+        if self._click_raises:
+            raise RuntimeError("Timeout 10000ms exceeded.")
+
+
+class _FakeClock:
+    """替换 chat_mod 命名空间里的 time 名字（不动 stdlib time 模块本身）：
+    `time()` 每次前进 step 秒、`sleep()` 只记录。grab_detail 的 5s/15s 轮询与
+    human_pointer_walk 的 40-120ms 停顿都不该在测试里真等。"""
+
+    def __init__(self, start=0.0, step=0.0):
+        self.now = start
+        self.step = step
+        self.slept = []
+
+    def time(self):
+        v = self.now
+        self.now += self.step
+        return v
+
+    def sleep(self, seconds):
+        self.slept.append(seconds)
+
+
+def test_human_pointer_walk_beats_around_bounding_box_and_each_move(monkeypatch):
+    """#56 验收 1：`bounding_box()` 与**每一次** `mouse.move()` 前后各一拍（票面点名的位点）。
+    步数由 rng 决定，故断言「成对 + 从 1 递增 + 末尾那次瞄准落点」，不锁死步数。"""
+    page, el, beat = _BeatPage(), _BeatEl(box={"x": 100, "y": 100, "width": 40, "height": 20}), _BeatRecorder()
+    monkeypatch.setattr(chat_mod, "time", _FakeClock())
+    chat_mod.human_pointer_walk(page, el, rng=random.Random(7), beat_fn=beat)
+    assert beat.labels[:2] == ["pointer:bounding-box:pre", "pointer:bounding-box:post"]
+    moves = [lbl for lbl in beat.labels if lbl.startswith("pointer:mouse-move:")]
+    assert len(moves) == 2 * len(page.mouse.moves), "每个 mouse.move 前后各一拍（成对）"
+    pres = [lbl for lbl in moves if lbl.endswith(":pre")]
+    assert pres == [f"pointer:mouse-move:{i}:pre" for i in range(1, len(pres))] + ["pointer:mouse-move:aim:pre"], (
+        "分段轨迹按轮次编号，落点那一次单独可辨"
+    )
+
+
+def test_human_pointer_walk_beats_stop_at_the_call_that_hung(monkeypatch):
+    """楔死现场读法（A3 的判据本体）：bounding_box 不返回时最后一条节拍是
+    `pointer:bounding-box:pre` 而不是 post——没有栈也能指认停在哪个调用上。
+    #56 修复轮 F4①补一条 `pointer:error` 把它与「抛了异常被吞掉」分开：本用例用的是
+    「异常代替楔死」的替身，所以两条都在；真楔死时 error 拍点也出不来（进程停在那里），
+    「只有 pre、既无 post 也无 error」才是楔死指纹。"""
+
+    class _HangEl:
+        def bounding_box(self):
+            raise RuntimeError("never returns（本用例用异常代替楔死，机制同一条 label）")
+
+    beat = _BeatRecorder()
+    chat_mod.human_pointer_walk(_BeatPage(), _HangEl(), rng=random.Random(1), beat_fn=beat)
+    assert beat.labels == ["pointer:bounding-box:pre", "pointer:error"], "没出来就不拍 post"
+
+
+def test_coordinate_click_beats_every_bare_call_in_order(monkeypatch):
+    """坐标点击里两个 `page.evaluate`（scrollIntoView / innerWidth）都是 evaluateExpression
+    的裸奔调用，加上 bounding_box 与 mouse.click——整段顺序必须完全可读。"""
+    el = _BeatEl(box={"x": 300, "y": 200, "width": 100, "height": 40})
+    beat = _BeatRecorder()
+    assert chat_mod.coordinate_click(_BeatPage(), el, beat_fn=beat) is True
+    assert beat.labels == [
+        "click:evaluate-scroll:pre",
+        "click:evaluate-scroll:post",
+        "click:bounding-box:pre",
+        "click:bounding-box:post",
+        "click:evaluate-viewport:pre",
+        "click:evaluate-viewport:post",
+        "click:mouse-click:pre",
+        "click:mouse-click:post",
+    ]
+
+
+def test_coordinate_click_does_not_beat_calls_it_never_makes():
+    """视口外宁可不点：`click:mouse-click:pre` 不得出现——节拍跟着实际控制流走，
+    不是无条件成对，否则 label 流会谎报「进了那个调用」。"""
+    beat = _BeatRecorder()
+    off = _BeatEl(box={"x": -500, "y": 200, "width": 100, "height": 40})
+    assert chat_mod.coordinate_click(_BeatPage(), off, beat_fn=beat) is False
+    assert beat.labels[-1] == "click:evaluate-viewport:post"
+    assert "click:mouse-click:pre" not in beat.labels
+
+
+def test_click_with_retry_beats_cover_the_whole_retry_ladder():
+    """重试阶梯（坐标 → handle click → 关遮罩 → force）逐步有拍：阶梯本身就是
+    「同一段动作里的多个停摆窗口」，最后一条 label 要能指到具体哪一步。
+    三次 handle.click 全抛 ⇒ 三处都是「pre + error、无 post」（修复轮 F4①之后 error 收尾）。"""
+    page, beat = _BeatPage(), _BeatRecorder()
+    el = _BeatEl(box=None, click_raises=True)  # 无几何 ⇒ 坐标段直接 False；handle 三次全抛
+    assert chat_mod.click_with_retry(page, el, action="立即沟通按钮", beat_fn=beat) is False
+    for lbl in (
+        "click:handle:pre",
+        "click:dismiss-overlays:pre",
+        "click:dismiss-overlays:post",
+        "click:handle-retry:pre",
+        "click:handle-force:pre",
+    ):
+        assert lbl in beat.labels, f"阶梯缺拍点 {lbl}"
+    assert beat.labels[-1] == "click:handle-force:error", "失败出口停在最后一次点击的异常出口，不谎报返回"
+    for not_run in ("click:handle:post", "click:handle-retry:post", "click:handle-force:post"):
+        assert not_run not in beat.labels
+
+
+def test_click_with_retry_passes_the_beat_down_to_its_helpers(monkeypatch):
+    """click_with_retry 自己只懂动作、不懂心跳：它把同一个 beat_fn 透传给
+    human_pointer_walk 与 coordinate_click，否则下层裸奔调用点仍然无名。"""
+    monkeypatch.setattr(chat_mod, "time", _FakeClock())  # 轨迹里的 40-120ms 停顿不真等
+    beat = _BeatRecorder()
+    el = _BeatEl(box={"x": 300, "y": 200, "width": 100, "height": 40})
+    chat_mod.click_with_retry(_BeatPage(), el, action="职位卡片", beat_fn=beat)
+    assert "pointer:bounding-box:pre" in beat.labels, "指针轨迹段的拍必须由上层透下来"
+    assert "click:mouse-click:pre" in beat.labels, "坐标点击段的拍同理"
+
+
+def test_grab_detail_beats_dom_poll_rounds(monkeypatch):
+    """#56 验收 1：DOM 轮询的 `page.evaluate`（evaluateExpression 裸奔）与随后的
+    `wait_for_timeout` 逐轮有拍，轮次编号进 label——「死在第几轮」直接读得出来。"""
+    page = _BeatPage(evaluate_seq=["", "JD 全文：负责测试"])
+    beat = _BeatRecorder()
+    monkeypatch.setattr(chat_mod, "time", _FakeClock(step=0.5))
+    got = chat_mod.grab_detail(page, {"data": None}, beat_fn=beat)
+    assert got == "JD 全文：负责测试"
+    assert beat.labels == [
+        "jd:dom-poll:1:pre",
+        "jd:dom-poll:1:post",
+        "jd:dom-wait:1:pre",
+        "jd:dom-wait:1:post",
+        "jd:dom-poll:2:pre",
+        "jd:dom-poll:2:post",
+    ]
+
+
+def test_grab_detail_beats_xhr_wait_rounds(monkeypatch):
+    """DOM 全落空后转 XHR 空等（票面点名的同族站点）：那一段每轮一拍，
+    并在详情响应到达后收口——楔死在这里时最后一条 label 是 `jd:xhr-wait:N:*`。"""
+    detail = {"data": None}
+
+    def arrive(n, ms):
+        if ms == 300:  # 空等段第一次等待后响应到达，测试不必真等 15s
+            detail["data"] = {"zpData": {"jobInfo": {"postDescription": "JD：XHR 兜底"}}}
+
+    page = _BeatPage(evaluate_seq=["", "", "", ""], on_wait=arrive)
+    beat = _BeatRecorder()
+    monkeypatch.setattr(chat_mod, "time", _FakeClock(step=1.0))
+    assert chat_mod.grab_detail(page, detail, beat_fn=beat) == "JD：XHR 兜底"
+    assert beat.labels[:4] == [
+        "jd:dom-poll:1:pre",
+        "jd:dom-poll:1:post",
+        "jd:dom-wait:1:pre",
+        "jd:dom-wait:1:post",
+    ]
+    assert beat.labels[-2:] == ["jd:xhr-wait:1:pre", "jd:xhr-wait:1:post"]
+    assert "jd:dom-poll:4:post" in beat.labels, "5s 预算按 1s/轮 = 4 轮 DOM 轮询"
+
+
+# --- #56 修复轮 F4①：吞掉异常的出口要有独立拍点 ---
+#
+# 「pre 有 post 无」过去同时表示两件事：① 卡在这个调用里（楔死，C 段要判栈的那一种）；
+# ② 这个调用抛了异常、走了吞掉异常的出口（普通失败，与楔死无关）。判据二义会让 C 段把
+# 一次正常的 handle click 超时读成「停在无超时调用上」。修法：在吞异常的出口补一条
+# 同命名空间的 `*:error` 拍点——**返回值与控制流一字不动**（拍点异常由注入方吞）。
+
+
+def test_human_pointer_walk_beats_its_swallowed_exception(monkeypatch):
+    """`human_pointer_walk` 整段包在 try/except 里（轨迹属锦上添花，任何失败都让位给正常点击）：
+    旧写法下它抛异常与它楔住留下的 label 完全一样。"""
+
+    class _BoomEl:
+        def bounding_box(self):
+            raise RuntimeError("Timeout 30000ms exceeded")
+
+    beat = _BeatRecorder()
+    monkeypatch.setattr(chat_mod, "time", _FakeClock())
+    assert chat_mod.human_pointer_walk(_BeatPage(), _BoomEl(), rng=random.Random(1), beat_fn=beat) is None
+    assert beat.labels == ["pointer:bounding-box:pre", "pointer:error"], "pre + error＝抛异常，不是没出来"
+    assert "pointer:bounding-box:post" not in beat.labels
+
+
+def test_coordinate_click_beats_both_error_exits():
+    """`coordinate_click` 的两个 except 出口（滚动 evaluate 吞掉后继续 / 整段异常返回 False）
+    各留一条 label；bail（无 box、视口外）不是异常，不得冒充 error 拍点。"""
+
+    class _EvalBoomPage(_BeatPage):
+        def evaluate(self, js, *args):
+            self.evaluated.append(js)
+            raise RuntimeError("evaluateExpression never returns / blows up")
+
+    beat = _BeatRecorder()
+    el = _BeatEl(box={"x": 300, "y": 200, "width": 100, "height": 40})
+    assert chat_mod.coordinate_click(_EvalBoomPage(), el, beat_fn=beat) is False
+    assert beat.labels == [
+        "click:evaluate-scroll:pre",
+        "click:evaluate-scroll:error",
+        "click:evaluate-scroll:post",
+        "click:bounding-box:pre",
+        "click:bounding-box:post",
+        "click:evaluate-viewport:pre",
+        "click:error",
+    ], "滚动那次异常吞掉后照原样继续，视口那次异常从外层出口返回 False"
+    assert "click:mouse-click:pre" not in beat.labels, "异常出口之后不得再拍后续调用（节拍跟着实际控制流）"
+
+
+def test_coordinate_click_bail_paths_emit_no_error_beat():
+    """无 box / 视口外是**正常 bail**（返回 False），不是吞掉的异常：不得落 error 拍点，
+    否则 C 段会把「宁可不点」读成一次协议故障。"""
+    beat = _BeatRecorder()
+    assert chat_mod.coordinate_click(_BeatPage(), _BeatEl(box=None), beat_fn=beat) is False
+    assert beat.labels == [
+        "click:evaluate-scroll:pre",
+        "click:evaluate-scroll:post",
+        "click:bounding-box:pre",
+        "click:bounding-box:post",
+    ]
+    assert not [lbl for lbl in beat.labels if lbl.endswith(":error")]
+
+
+def test_error_post_docstrings_match_the_pinned_sequences():
+    """修复轮 4（D）：error/post 的边界以实测为准（两条序列分别由
+    `test_human_pointer_walk_beats_its_swallowed_exception` 与
+    `test_coordinate_click_beats_both_error_exits` 钉死），两处 docstring 各自写明
+    「覆盖到哪、post 证明什么」——`human_pointer_walk` 的「异常出口不拍 post」只限本函数，
+    `coordinate_click` 的 scroll evaluate 异常出口 error 后 post 照落。这条文档契约防止
+    再把一处的结论外推到另一处（旧注释正是这么被读错的）。"""
+    doc_walk = chat_mod.human_pointer_walk.__doc__ or ""
+    doc_click = chat_mod.coordinate_click.__doc__ or ""
+    assert "本函数内异常出口不拍 post" in doc_walk, "边界必须显式限定在本函数（post＝该调用正常返回）"
+    assert "别外推" in doc_walk, "不得被读成同族函数的通用规则"
+    assert "三拍全落" in doc_click, "scroll evaluate 的异常出口序列按实测写明（pre+error+post）"
+    assert "不证明 evaluate 成功" in doc_click, "post 的真实含义要写明：返回了 ≠ 成功了"
+
+
+def test_click_with_retry_beats_its_three_handle_error_exits(monkeypatch):
+    """handle click 族的三个 except 出口（首点 / 关遮罩后重试 / force）都要有独立 error 拍点：
+    这三步带 timeout，异常是它们的**正常出口**（点不动就下一步），旧写法只留一个 pre。
+    阶梯顺序与返回值不变——最后一条 label 现在指向失败出口本身。"""
+    monkeypatch.setattr(chat_mod, "time", _FakeClock())
+    beat = _BeatRecorder()
+    el = _BeatEl(box=None, click_raises=True)
+    assert chat_mod.click_with_retry(_BeatPage(), el, action="立即沟通按钮", beat_fn=beat) is False
+    for lbl in ("click:handle:error", "click:handle-retry:error", "click:handle-force:error"):
+        assert lbl in beat.labels, f"异常出口缺拍点 {lbl}"
+    assert beat.labels[-1] == "click:handle-force:error"
+    assert beat.labels.count("click:handle:post") == 0
+
+
+def test_click_with_retry_success_paths_emit_no_error_beat(monkeypatch):
+    """成功路径零 error 拍点（取证不谎报）：坐标点击点中就直接返回 True。"""
+    monkeypatch.setattr(chat_mod, "time", _FakeClock())
+    beat = _BeatRecorder()
+    el = _BeatEl(box={"x": 300, "y": 200, "width": 100, "height": 40})
+    assert chat_mod.click_with_retry(_BeatPage(), el, action="职位卡片", beat_fn=beat) is True
+    assert not [lbl for lbl in beat.labels if lbl.endswith(":error")]
+
+
+def test_dismiss_overlays_swallows_internally_so_its_beat_has_no_error_exit(monkeypatch):
+    """#56 修复轮 3 R4（注释口径的实测锚）：`dismiss_overlays` 里每个选择器各自包在
+    try/except 里，异常**在它自己那一层就被吞掉**、控制流回到 for——`click_with_retry`
+    因此永远看不到异常，`click:dismiss-overlays:pre` 也就**没有**配套的 `:error` 拍点
+    （给它加拍点会改动与本票无关的遮罩层语义，本轮明确不做）。
+
+    于是本层的出口分两类，C 段判栈时按这个读：
+    · 有 `*:error` 的三个 handle click（首点 / 关遮罩后重试 / force）——「抛异常」与
+      「调用没回来」读得出来；
+    · 没有 `*:error` 的 `dismiss-overlays` 这一段：`pre`+`post` 只证明「走完了」，**不证明**
+      关掉过任何遮罩（内部异常照样走完）；`pre` 无 `post` 只剩两种可能——卡在里面的
+      裸奔 `querySelectorAll` 上（楔死指纹），或 BaseException（如 KeyboardInterrupt）逸出。
+    """
+    monkeypatch.setattr(chat_mod, "time", _FakeClock())
+
+    class _QueryBoomPage(_BeatPage):
+        def query_selector_all(self, sel):
+            raise RuntimeError("querySelectorAll 抛异常（本用例用异常代替「遮罩一个都没关掉」）")
+
+    beat = _BeatRecorder()
+    el = _BeatEl(box=None, click_raises=True)
+    assert chat_mod.click_with_retry(_QueryBoomPage(), el, action="立即沟通按钮", beat_fn=beat) is False
+    assert "click:dismiss-overlays:pre" in beat.labels and "click:dismiss-overlays:post" in beat.labels, (
+        "内部异常不改变上层控制流：pre 之后仍照常 post"
+    )
+    assert not [lbl for lbl in beat.labels if "dismiss-overlays" in lbl and lbl.endswith(":error")], (
+        "已知缺口（不是漏接）：遮罩层没有 error 拍点，见 docstring 的两类出口"
+    )
+    assert chat_mod.dismiss_overlays(_QueryBoomPage()) == 0, "异常在内部吞掉：返回 0、不外抛"
+
+
+# --- #56 修复轮 F4②：A3 漏接的「同族无超时站点」---
+
+
+class _FindPage:
+    """查找段替身：`query_selector_all` 恒空、`query_selector` 恒 None（全部选择器落空），
+    并记录询问顺序——接拍点时「不新增重试、不改查找顺序」就靠这两条断言把住。"""
+
+    def __init__(self):
+        self.asks = []
+
+    def query_selector_all(self, sel):
+        self.asks.append(sel)
+        return []
+
+    def query_selector(self, sel):
+        self.asks.append(sel)
+        return None
+
+
+def test_find_comm_button_beats_each_query_selector_all():
+    """`find_comm_button` 的 `query_selector_all` 是 timeout=None 的裸奔调用，A3 段里
+    查找前一个拍都没有——楔死在找按钮这一段时，最后一条 label 只能停在上一段的 post。"""
+    page, beat = _FindPage(), _BeatRecorder()
+    assert chat_mod.find_comm_button(page, beat_fn=beat) is None
+    pres = [lbl for lbl in beat.labels if lbl.endswith(":pre")]
+    posts = [lbl for lbl in beat.labels if lbl.endswith(":post")]
+    assert len(pres) == len(posts) == len(page.asks) == len(chat_mod.COMM_BTN_SELECTORS) + 2, (
+        "每个选择器一次前后拍：顺序与次数都照原样（不新增重试）"
+    )
+    assert pres[0] == "find:comm-btn:query:1:pre" and pres[-1] == f"find:comm-btn:query:{len(pres)}:pre"
+    assert page.asks == chat_mod.COMM_BTN_SELECTORS + ["button", "a.btn"], "查找顺序一字未动"
+
+
+def test_find_comm_button_default_beat_fn_is_noop():
+    """默认 None = 零行为变更（A3 的另一半保证）：不注入节拍时照常查完全部选择器、一个拍不发。"""
+    page = _FindPage()
+    assert chat_mod.find_comm_button(page) is None
+    assert len(page.asks) == len(chat_mod.COMM_BTN_SELECTORS) + 2
+
+
+def test_find_comm_button_beats_the_swallowed_query_exception():
+    """修复轮 4（A5）：外层 `except: continue` 的出口补 `find:comm-btn:query:{n}:error`——
+    补点前「pre 有 post 无」同时表示「卡在这个调用里」与「这个调用抛了异常被吞」，
+    C 段判栈会二义。异常不改变查找顺序与次数（照原样继续下一个选择器）。"""
+
+    class _FirstBoomPage(_FindPage):
+        def query_selector_all(self, sel):
+            self.asks.append(sel)
+            if len(self.asks) == 1:
+                raise RuntimeError("querySelectorAll 挂了")
+            return []
+
+    page, beat = _FirstBoomPage(), _BeatRecorder()
+    assert chat_mod.find_comm_button(page, beat_fn=beat) is None, "异常被吞：返回值仍是 None"
+    assert beat.labels[0] == "find:comm-btn:query:1:pre"
+    assert "find:comm-btn:query:1:error" in beat.labels
+    assert "find:comm-btn:query:1:post" not in beat.labels, "抛出后该调用没有 post"
+    assert len(page.asks) == len(chat_mod.COMM_BTN_SELECTORS) + 2, "异常不改变查找顺序与次数"
+
+
+class _FindHitPage(_FindPage):
+    """命中替身：第一个选择器返回一个可见按钮 → 触发逐元素循环里那次 scrollIntoView。"""
+
+    def __init__(self, scroll_boom=False):
+        super().__init__()
+        self.scroll_boom = scroll_boom
+
+    def query_selector_all(self, sel):
+        self.asks.append(sel)
+        return [self._Btn()] if len(self.asks) == 1 else []
+
+    def evaluate(self, js, *args):
+        if self.scroll_boom:
+            raise RuntimeError("evaluateExpression 挂了")
+        return None
+
+    class _Btn:
+        def is_visible(self):
+            return True
+
+        def inner_text(self):
+            return "立即沟通"
+
+
+def test_find_comm_button_beats_the_scroll_evaluate():
+    """修复轮 4（A6，票面 §1）：命中后那次 `page.evaluate(scrollIntoView)` 是
+    evaluateExpressionHandle 同族（coordinate_click 同型调用已拍点），此处补 pre/post/error——
+    正常出口 pre+post；异常出口 error 也落（滚动失败原本就吞掉继续），post＝这段执行完了。"""
+    page, beat = _FindHitPage(), _BeatRecorder()
+    assert chat_mod.find_comm_button(page, beat_fn=beat) is not None
+    assert beat.labels == [
+        "find:comm-btn:query:1:pre",
+        "find:comm-btn:query:1:post",
+        "find:comm-btn:scroll:1:pre",
+        "find:comm-btn:scroll:1:post",
+    ]
+    page, beat = _FindHitPage(scroll_boom=True), _BeatRecorder()
+    assert chat_mod.find_comm_button(page, beat_fn=beat) is not None, "滚动失败不阻断（异常在内部吞掉）"
+    assert beat.labels == [
+        "find:comm-btn:query:1:pre",
+        "find:comm-btn:query:1:post",
+        "find:comm-btn:scroll:1:pre",
+        "find:comm-btn:scroll:1:error",
+        "find:comm-btn:scroll:1:post",
+    ]
+
+
+def test_platform_beat_sites_are_silent_without_beat_fn(monkeypatch):
+    """默认 None = 零行为变更（A3 的另一半保证）：平台层不注入时照常动作、一个拍都不发。
+    chat_first.py 是平台层，本就不该知道心跳存在——节拍由调用方（live_apply）注入。"""
+    clock = _FakeClock()
+    monkeypatch.setattr(chat_mod, "time", clock)
+    page = _BeatPage()
+    el = _BeatEl(box={"x": 300, "y": 200, "width": 100, "height": 40})
+    assert chat_mod.human_pointer_walk(page, el, rng=random.Random(3)) is None
+    assert page.mouse.moves, "不注入节拍时指针轨迹照常走"
+    assert chat_mod.coordinate_click(page, el) is True
+    assert page.mouse.clicks == [(350.0, 220.0)]
+    assert chat_mod.grab_detail(_BeatPage(evaluate_seq=["JD"]), {"data": None}) == "JD"
+    assert clock.slept, "轨迹内的 time.sleep 未被跳过（节拍不改变动作节奏）"
+
+
+# --- #56 A5①：grab_detail 落空出口的可观测化（一次性选择器命中探测 + 等待时长进容器）---
+#
+# 失败基线（改前实测，`.venv/bin/python` 直接跑现版 grab_detail，DOM 全落空 + XHR 空等）：
+#   返回 '' / 真实耗时 20.05s（5s DOM 轮询 + 15s XHR 空等）/ 容器原样 {'data': None}
+#   —— 什么都没落：既没有「等了多久」，也没有「选择器命中数」，no_jd 因此完全不可归因。
+# 本段锁的就是这一处：改后同一出口必须把四件事里的两件（等了多久、DOM 命中数）连同
+# 岗位详情页 URL 落进容器，且**返回类型仍是 str**（空串＝没拿到，契约一字未动）。
+
+
+class _JdPage:
+    """grab_detail 专用页面替身：DOM 轮询恒落空，探测 JS 返回编排好的逐选择器命中数。
+    以 JS 里有没有 `querySelectorAll` 区分「轮询」与「探测」——轮询 JS 只用 `querySelector`
+    （A5 的探测是新增的第二段 JS，本用例同时钉住「探测只在失败出口跑一次」）。"""
+
+    def __init__(self, probe=None, probe_raises=False, url="https://www.zhipin.com/job_detail/e1.html"):
+        self.probe = probe if probe is not None else []
+        self.probe_raises = probe_raises
+        self.poll_calls = 0
+        self.probe_calls = 0
+        self.waits = []
+        self.url = url
+
+    def evaluate(self, js, *args):
+        # 与 _BeatPage 同形态收下第二个位置参数（真实 page.evaluate 的 arg），不用它
+        if "querySelectorAll" in js:
+            self.probe_calls += 1
+            if self.probe_raises:
+                raise RuntimeError("Target page, context or browser has been closed")
+            return self.probe
+        self.poll_calls += 1
+        return ""
+
+    def wait_for_timeout(self, ms):
+        self.waits.append(ms)
+
+
+_PROBE_HIT = {"selector": ".job-sec-text", "hits": 2, "nonempty": 0}
+_PROBE_MISS = {"selector": ".job-detail .text", "hits": 0, "nonempty": 0}
+
+
+def test_grab_detail_empty_exit_lands_probe_evidence(monkeypatch):
+    """#56 验收 1（A5 侧）：落空出口把「等了多久 + DOM 选择器命中数 + URL」写进容器，
+    返回值仍是空串（合同不变）。轮询轮数与真实 evaluate 次数一一对得上——取证不能编数。"""
+    monkeypatch.setattr(chat_mod, "time", _FakeClock(step=1.0))
+    page = _JdPage(probe=[_PROBE_HIT, _PROBE_MISS])
+    container = {"data": None}
+    assert chat_mod.grab_detail(page, container) == "", "返回契约：仍是 str，空串=没拿到"
+    out = container["empty_outcome"]
+    assert out["url"] == page.url
+    assert out["hit_total"] == 2 and out["nonempty_total"] == 0
+    assert out["hit_selectors"] == [".job-sec-text"], "只报有命中的选择器（命中数为 0 的不进短名单）"
+    assert out["selectors"] == [_PROBE_HIT, _PROBE_MISS], "逐选择器原样留存：形态漂移假说要靠这份对照"
+    assert out["dom_rounds"] == page.poll_calls, "落盘的轮数必须等于真实 evaluate 次数"
+    assert out["xhr_rounds"] == sum(1 for w in page.waits if w == 300), "XHR 空等轮数同口径"
+    assert out["seconds"] == round(out["dom_seconds"] + out["xhr_seconds"], 1)
+
+
+def test_grab_detail_probe_runs_once_and_never_on_success(monkeypatch):
+    """成本口径（A3 实测：一次原子写 ~0.47ms，取证不能做成性能回归）：探测**只在失败出口
+    跑一次**——不进轮询循环、成功路径零次。票面「DOM 选择器命中数」这个新字段的全部代价
+    就是这一条 evaluate。"""
+    monkeypatch.setattr(chat_mod, "time", _FakeClock(step=1.0))
+    page = _JdPage(probe=[_PROBE_MISS])
+    chat_mod.grab_detail(page, {"data": None})
+    assert page.probe_calls == 1, "失败出口一次，不多不少（逐轮探测会把 20s 干等放大成上百次往返）"
+    assert page.poll_calls > 1, "轮询确实用了多次 evaluate，探测不与它们混算"
+
+    hit = _BeatPage(evaluate_seq=["JD 全文：负责测试"])
+    container = {"data": None}
+    assert chat_mod.grab_detail(hit, container) == "JD 全文：负责测试"
+    assert "empty_outcome" not in container, "成功路径不写取证字段（也不该多跑一次协议往返）"
+
+
+def test_grab_detail_both_empty_case_still_records(monkeypatch):
+    """票面第三类的证据形态：详情响应**到了**但 postDescription 为空 + DOM 零命中。
+    这是唯一能说「这个岗位没内容」的形态，故必须留下 hit_total=0 的探测结果供归因。"""
+    monkeypatch.setattr(chat_mod, "time", _FakeClock(step=1.0))
+    detail = {"data": {"code": 0, "zpData": {"jobInfo": {"postDescription": ""}}}}
+    page = _JdPage(probe=[_PROBE_MISS, dict(_PROBE_MISS, selector=".job-detail-content")])
+    assert chat_mod.grab_detail(page, detail) == ""
+    out = page.probe  # 探测确实跑过
+    assert out and all(h["hits"] == 0 for h in out)
+    assert detail["empty_outcome"]["hit_total"] == 0 and detail["empty_outcome"]["hit_selectors"] == []
+
+
+# --- #56 修复轮 3 R2：`grab_detail` 的「有 data」口径统一到 postDescription 取值链 ---
+#
+# 旧写法 `if detail_data["data"]:` 先拿**外层 dict 的真值**冒充「拿到正文」，再在取值链上
+# `.get("zpData", {}).get("jobInfo", {}).get("postDescription", "")`：
+#   ① `{"code": 0, "zpData": null}`（岗位失效时 站内真实回这个形态）当场 AttributeError
+#      从 grab_detail 逸出——「返回类型恒为 str、契约一字未动」这条 A5 守住的边界被破在半路；
+#   ② 链上取到非字符串（如 `postDescription: 123`）时被当正文返回，编排层据此产出一份
+#      `jdText` 不是 JD 正文的 request_N.json，读起来像一次正常起草。
+# 现在两侧共用 `detail_post_description` 这一条链（编排层 `classify_no_jd` 引用同一个函数，
+# 单一真源）：取不到**非空字符串正文**就走落空出口，「返回空串」与「XHR 有可用正文」互斥。
+
+
+def test_detail_post_description_is_form_tolerant():
+    """取值链本体：逐层形态不苛求（缺失 / null / 非字典 / 正文非字符串）一律返回 ""，
+    只有真拿到字符串正文才返回它（空串正文也算没有正文）。"""
+    assert chat_mod.detail_post_description({"zpData": {"jobInfo": {"postDescription": "JD 全文"}}}) == "JD 全文"
+    assert chat_mod.detail_post_description({"zpData": {"jobInfo": {"postDescription": ""}}}) == ""
+    for bad in (
+        None,
+        [],
+        "不是响应",
+        {},
+        {"zpData": None},
+        {"zpData": {"jobInfo": None}},
+        {"zpData": {"jobInfo": {}}},
+        {"zpData": {"jobInfo": {"postDescription": None}}},
+        {"zpData": {"jobInfo": {"postDescription": 123}}},
+    ):
+        assert chat_mod.detail_post_description(bad) == "", f"{bad!r} 取不到正文却不算空？"
+
+
+def test_grab_detail_nonempty_data_dict_without_body_takes_the_empty_exit(monkeypatch):
+    """R2 反例①：`data` 是非空 dict 但链上没有正文（`zpData: null`）→ 返回 ""、照常落
+    `empty_outcome` 取证，而不是让 AttributeError 逸出破坏返回契约。"""
+    monkeypatch.setattr(chat_mod, "time", _FakeClock(step=1.0))
+    page = _JdPage(probe=[_PROBE_MISS])
+    container = {"data": {"code": 0, "zpData": None, "message": "岗位已下线"}}
+    assert chat_mod.grab_detail(page, container) == ""
+    assert container["empty_outcome"]["hit_total"] == 0, "落空出口照常取证（不改返回契约的同一处）"
+    assert page.probe_calls == 1
+
+
+def test_grab_detail_never_returns_a_non_string_as_the_body(monkeypatch):
+    """R2 反例②：链上取到非字符串（`postDescription: 123`）不算正文——否则 `_acquire_and_draft_greeting`
+    会产出一份 jdText=123 的 request_N.json，「拿不到正文」被伪装成「拿到了」。"""
+    monkeypatch.setattr(chat_mod, "time", _FakeClock(step=1.0))
+    container = {"data": {"code": 0, "zpData": {"jobInfo": {"postDescription": 123}}}}
+    assert chat_mod.grab_detail(_JdPage(probe=[_PROBE_MISS]), container) == ""
+    assert container["empty_outcome"], "同样走落空出口"
+
+    body = {"data": {"code": 0, "zpData": {"jobInfo": {"postDescription": "JD：XHR 兜底正文"}}}}
+    assert chat_mod.grab_detail(_JdPage(probe=[_PROBE_MISS]), body) == "JD：XHR 兜底正文"
+
+
+def test_grab_detail_probe_failure_keeps_str_contract(monkeypatch):
+    """探测本身失败（页面已关是最现实的形态）时：返回仍是 ""、异常不外抛、
+    并如实留下 probe_error——取证缺口不粉饰成「命中数为 0」，也不反噬投递。"""
+    monkeypatch.setattr(chat_mod, "time", _FakeClock(step=1.0))
+    container = {"data": None}
+    page = _JdPage(probe_raises=True)
+    assert chat_mod.grab_detail(page, container) == ""
+    out = container["empty_outcome"]
+    assert "probe_error" in out and "closed" in out["probe_error"]
+    assert "hit_total" not in out, "没探到就不写命中数（0 会被读成「选择器全落空」的假证据）"
+    assert out["dom_rounds"] == page.poll_calls, "等待时长与轮数仍是实测值"
+
+
+def test_grab_detail_beats_the_probe_on_empty_exit(monkeypatch):
+    """#56 A3 × A5 的交点：探测也是一次 evaluateExpression 裸奔调用，必须有名有姓；
+    探测抛出时只有 pre 没有 post——最后一条 label 依旧与实际控制流严格一致。"""
+    monkeypatch.setattr(chat_mod, "time", _FakeClock(step=1.0))
+    beat = _BeatRecorder()
+    chat_mod.grab_detail(_JdPage(probe=[_PROBE_MISS]), {"data": None}, beat_fn=beat)
+    assert beat.labels[-2:] == ["jd:dom-probe:pre", "jd:dom-probe:post"]
+
+    beat2 = _BeatRecorder()
+    chat_mod.grab_detail(_JdPage(probe_raises=True), {"data": None}, beat_fn=beat2)
+    assert beat2.labels[-1] == "jd:dom-probe:pre", "探测没出来不谎报 post"
+    assert "jd:dom-probe:post" not in beat2.labels
+
+
+def test_grab_detail_records_url_failure_instead_of_losing_evidence(monkeypatch):
+    """`page.url` 在页面已关时会抛——取证不能让这一抛把整个 empty_outcome 带走：
+    等待时长与命中数照落，url 留空并写 url_error（缺口本身也要留痕）。"""
+    monkeypatch.setattr(chat_mod, "time", _FakeClock(step=1.0))
+
+    class _ClosedUrl:
+        """除 `url` 外全部委托给内层替身（`url` 是类上的 data descriptor，
+        所以不能用子类赋值覆盖——内层 `__init__` 里的 `self.url = url` 会直接报错）。"""
+
+        def __init__(self, inner):
+            self.inner = inner
+
+        def __getattr__(self, name):
+            return getattr(self.inner, name)
+
+        @property
+        def url(self):
+            raise RuntimeError("Target page, context or browser has been closed")
+
+    inner = _JdPage(probe=[_PROBE_MISS])
+    container = {"data": None}
+    assert chat_mod.grab_detail(_ClosedUrl(inner), container) == ""
+    out = container["empty_outcome"]
+    assert out["url"] == "" and "closed" in out["url_error"]
+    assert out["dom_rounds"] == inner.poll_calls and out["hit_total"] == 0
+
+
+def test_grab_detail_unwritable_container_does_not_raise(monkeypatch):
+    """容器形态诡异（不可写）时放弃取证而不是把落空出口变成抛异常的地方——
+    返回契约仍是 ""（观测层绝不新增失败面，#38 同口径）。"""
+    monkeypatch.setattr(chat_mod, "time", _FakeClock(step=1.0))
+
+    class _Frozen(dict):
+        def __setitem__(self, key, value):
+            raise RuntimeError("container is frozen")
+
+    page = _JdPage(probe=[_PROBE_MISS])
+    assert chat_mod.grab_detail(page, _Frozen({"data": None})) == ""
+    assert page.probe_calls == 1, "探测照跑（只是结果落不下），不改控制流"
+
+
+def test_grab_detail_bad_probe_shape_does_not_become_zero_hits(monkeypatch):
+    """探测返回形态异常（JS 侧改动 / evaluate 返回非列表）时**宁缺毋造**：
+    只落 probe_error，不落 `hit_total: 0`——0 命中是「DOM 与 XHR 双空」判据的 DOM 侧正向证据形态，
+    拿取证缺口去冒充它，等于把岗位判成无内容（票面点名的静默误杀）。"""
+    monkeypatch.setattr(chat_mod, "time", _FakeClock(step=1.0))
+    page = _BeatPage(evaluate_seq=["", "", "", ""])  # 探测落到默认 view（dict），不是列表
+    container = {"data": None}
+    assert chat_mod.grab_detail(page, container) == ""
+    out = container["empty_outcome"]
+    assert "hit_total" not in out and "hit_selectors" not in out
+    assert "形态异常" in out["probe_error"] and out["dom_rounds"] == 4

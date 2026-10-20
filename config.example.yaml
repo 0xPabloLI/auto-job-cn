@@ -1,0 +1,30 @@
+# auto-job-cn 编排配置模板（#14 T6）
+# 用法：复制为 repo 根的 config.yaml 后按自己情况填写（orchestrate.py 读它，没有也能跑，全用各脚本默认值）。
+#
+# 只支持以下 3 个键，其他键会被忽略并打印告警。解析器是极小 YAML 子集：
+# 仅支持顶层 key: value + 键下 "- 列表项" 两级；不支持嵌套 mapping / 多行字符串；
+# 标量一律按字符串读。
+#
+# 平台凭据不进 config：凭据走浏览器登录态（Camoufox 持久化 profile），
+# 首次或登录态过期时运行 python3 scripts/test_camoufox_login.py --login 登录目标站点
+# （open_browser.py 可唤起同一 profile 的浏览器窗口手动操作）。
+# config 里没有也不需要任何 cookies / 账号密码键。
+
+# 本地 repo 路径列表：repo_survey 阶段逐仓调研对象（写临时文件传 repo_survey.py --repos-file）。
+# 不配置则需自备 private/data/repos_list.txt，否则 repo_survey 阶段会失败。
+repos:
+  - /absolute/path/to/your-flagship-repo
+  - /absolute/path/to/another-repo
+
+# 行业语境调研查询串：industry_research 阶段作为 --query 传入（一行字符串）。
+# ⚠ 必须替换成你自己的行业——照抄示例会让行业调研跑错行业（#29）：
+industry_query: "<你的目标行业> 招聘市场行情、评价硬指标与技术坐标系"
+
+# 推特调研 handle 列表：每 handle 跑一次 twitter_survey.py --handle。
+# 不配置（键留空或整段注释掉）则编排自动跳过该阶段。不要照抄占位 handle——
+# 会被当成真实 handle 触发抓取，exit 1 中断编排。需要时取消注释并填自己的 handle：
+# twitter_handles:
+#   - your_handle
+#
+# 每日投递上限不在这里配：投递由 live_apply 承担，读 APPLY_DAILY_LIMIT 环境变量
+# （默认自动阶梯：首日 20，每天 +2~5 抖动爬升，40 封顶）。

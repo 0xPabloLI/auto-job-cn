@@ -1,0 +1,35 @@
+name: Bug 报告
+description: 某个功能坏了或行为与预期不符
+labels: ["bug", "needs-triage"]
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: 发生了什么
+      description: 现象与预期行为的差异；有报错/日志/截图一并贴上（脱敏后）。
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: 复现步骤
+      description: 触发命令或对 agent 说的原话、当时的 Profile/平台/配置。
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: 证据
+      description: 台账/日志/退出码等运行时证据（private/ 下数据请脱敏）。
+  - type: dropdown
+    id: area
+    attributes:
+      label: 影响面
+      options:
+        - "area:pipeline（投递/追踪链路）"
+        - "area:platforms（平台适配）"
+        - "area:agent-harness（hooks/agent 文档）"
+        - "area:webui"
+        - "area:docs"
+    validations:
+      required: true

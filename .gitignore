@@ -1,0 +1,37 @@
+# 隐私数据：简历、投递台账、JD 数据、招呼语、截图、浏览器登录态
+private/
+
+# 工具本地数据
+.codeartsdoer/
+.arts/
+.trae/
+.workbuddy/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+*.egg-info/
+
+# 环境与密钥（模板是 .env.example / config.example.yaml，真实值不入库）
+.env
+.env.local
+.env.*.local
+
+# IDE
+.idea/
+.vscode/
+
+# macOS
+.DS_Store
+
+# Node（预留 Web UI）
+node_modules/
+dist/
+
+# 一次性研究脚本（路径替换有 bug，本地保留但不纳入 git）
+scripts/oneshot/

@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint-type-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install pinned dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Public boundary guard (PII)
+        # 公开仓第一道闸：个人数据/媒体/内部文档命中即失败（判据见 PRIVACY.md）
+        run: python3 scripts/check_public_boundary.py
+
+      - name: Lint (ruff)
+        run: ruff check scripts/
+
+      - name: Format check (ruff format)
+        run: ruff format --check scripts/
+
+      - name: Type check (mypy)
+        run: mypy scripts/
+
+      - name: Dead code check (vulture)
+        run: vulture scripts scripts/vulture_whitelist.py --exclude '*/oneshot/*' --min-confidence 90
+
+      - name: Unused dependencies check (deptry)
+        run: deptry scripts
+
+      - name: Tests (pytest, parallel + coverage gate)
+        # -m "not integration"：集成/E2E 冒烟（#40）需真实账号登录态，CI 默认跳过；
+        # 人工触发全量跑法见 docs/agents/integration-smoke.md
+        run: pytest -n auto -m "not integration" --cov=scripts --cov-report=term --cov-fail-under=83

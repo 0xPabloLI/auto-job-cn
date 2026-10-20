@@ -1,0 +1,105 @@
+# Git Workflow
+
+> 在 staging、commit、push、PR、跨分支操作或 context 切换前读取。
+
+## 1. Safety Baseline
+
+1. 先运行 `git status --short --branch`，再检查本次相关 diff。
+2. 未提交和未跟踪内容一律视为用户工作。只操作本 session 创建或修改的内容。
+3. 同一文件混有其他工作时，用 `git add -p` 只选择本 session hunk。
+4. stage 时显式列路径，不使用 `git add -A` 或 `git add .`。
+5. 不通过 restore、reset、clean、checkout 等方式覆盖或删除用户工作。
+
+## 2. Branch 与 Worktree
+
+- 永远不要在当前工作目录运行 `git checkout` 或 `git switch`。
+- 跨分支工作使用 `git worktree add`，只读查看使用 `git show branch:path`。
+- 向 `main` 交付使用独立 worktree/branch 和 PR，不在当前目录切换。
+- 添加 worktree 前确认目标目录、branch 名和当前 working tree 状态。
+
+## 3. Stash
+
+- 未经当前对话明确确认，不运行任何 stash 命令。
+- 如用户授权暂存，使用带说明的 `git stash push -m "<msg>"`。
+- 恢复前先展示 `git stash list`，未经确认不运行 `stash pop/apply/drop/clear`。
+- 如果 push 前必须 stash 非本 session 改动，只 commit，不 push。
+
+## 4. Commit Cadence
+
+1. 每个已验证的原子任务立即 commit。原子任务是一个 bug fix、独立 feature slice、机械 migration batch 或文档结构变更。
+2. 同一任务后续修复：
+   - 尚未 push：优先 amend 原 commit（写 ref 前先按 §9.5 复核身份）；
+   - 已 push：追加新 commit；
+   - 不改写已 push 到共享/保护分支的历史。
+3. 跨任务更正默认创建新的 atomic commit，不 amend 另一个任务。只有用户明确要求整理、相关历史尚未发布且不在共享分支上时，才使用 `git commit --fixup=<sha>` 与 autosquash。
+4. commit 前检查 staged diff 和 staged file list，确保只有本 session 内容。
+5. pre-commit hook 修改文件时，复查后只 amend 一次以纳入修复。
+6. commit 后立即用 `git show --stat HEAD` 核对文件清单只含本任务文件；发现混入其他 session 的文件立即向用户报告，共享分支上不用改写历史来修复混入。
+
+## 5. Push 与历史
+
+- 新增 commit 使用普通 `git push`。
+- 禁止 `git push --force`。
+- 只有用户明确要求改写历史、且分支为个人分支时，才考虑 `--force-with-lease`。
+- 已 push 到共享/保护分支的 commit 不 amend、rebase、squash 或 force-push。
+- push 是外部动作，只有用户已授权当前 push 才执行。
+
+## 6. Review-Compatible Baseline
+
+1. 开工前记录 baseline commit。
+2. ticket 定向验证通过后 commit。
+3. review 开始前记录 `taskHead = git rev-parse HEAD`；`code-review` 比较 `baseline...taskHead`，不使用会被并行 session 移动的裸 `HEAD`。
+4. 若 `baseline..taskHead` 含其他 session 的 commit，改用本任务首个 commit 的直接父提交作 baseline；仍无法形成连续任务区间时，停止并报告，不用路径过滤伪装成完整 review。
+5. review 修复后重新验证并创建修复 commit，再记录新的 `taskHead`；已 push 时只追加 commit。
+
+## 7. PR Guardrails
+
+- PR 内容只总结相对 `origin/main` 的变化。
+- PR title/body 使用 English。
+- Testing section 只列已验证且勾选完成的项目，否则不写。
+- PR push/open 后不 amend 或 rebase，后续使用新 commit。
+- **合并门禁：PR 存在未 resolve 的 review thread（bot 与人一视同仁）时不合并**——逐条真实修复或回应、thread resolve 后方可 merge；用户明确豁免除外。
+- **自主合并常设授权（用户裁决，2026-09-26）**：agent 对自己开出的 PR，在 CI 全绿、无未 resolve review thread、改动未超出已授权 ticket 范围时**直接 merge，不逐次请示**；仅当 review thread 指出实质问题、CI 失败、或改动越出 ticket 授权范围时停下向用户确认。
+- 不为清线程做 cosmetic fix；真实修复，否则留给 maintainer 决定。
+- 创建 PR 前先本地合并目标分支（`git merge origin/main` 或对应 target），解决冲突后再 push；不创建带冲突的 PR。
+
+## 8. Session Boundary
+
+- 只 commit 本 session 的改动。
+- 不顺手修复无关或非本 session 引入的问题。
+- 无法确认改动来源时停止，向用户报告。
+- session 结束时记录 commit hash、未 push 状态、验证证据和剩余 blocker。
+- **Session-Id 关联标识（安装了 hooks 的 checkout 强制，commit-msg hook 校验 trailer；strict 模式另校验登记）**：
+  - 开工先确认已安装：`git config core.hooksPath` 应为 `.githooks`（新 clone 跑 `bash scripts/install-git-hooks.sh`；它同时设置 strict 登记门控）。未安装时本规则仍是约定，只是无 hook 兜底。
+  - session 开工生成 id（格式 `<yyyymmdd>-<task>-<6hex>`，如 `20260903-refactor-a1b2c3`）并登记 `$(git rev-parse --git-common-dir)/session-pilot/pilot-log.md`（所有 worktree 共享；tool / Session-Id / baseline / commit 清单 / compact 状态）。**登记表内容边界**（2026-09-11 试点教训，上游已通用化为 core §9.5）：
+    - **只放会话接力状态**：baseline、做了什么、未完成项、环境怪癖。
+    - **持久教训不放这里**：会改变未来行为的过程教训升级到管该行为的规范文档，登记表条目只留「已升级」一句——未 track 的登记表不在任何指针链上，教训放这里 = 赌下个 session 恰好读到。
+    - **不重复交付细节**：交付记录归 tracker 关票评论，状态归 roadmap——登记表只留 baseline / 重启点 / 环境怪癖 / 在途避让。
+    - **条目字段名固定**：tool / Session-Id / baseline / task / commit_sha_list / compact / 观察 / session_end（可选）。
+    - **编号唯一**：条目号全表唯一；跨工具重号时后到者改用 `#N-<tool>` 后缀。
+    - **轮转**：只保留最近一次连续工作期的条目，更早的下沉归档文件（同样不进仓库）。
+  - commit 带 `--trailer "Session-Id: <id>"`；strict 下 hook 校验 id 已登记（fail-closed：无登记表也拦截）；amend 不得叠加第二个 id（双 id 让两侧精确查询都失效）。
+  - 用 `bash scripts/session-launcher.sh start` 开工的会话无需手写 trailer：per-session 状态文件存在时 prepare-commit-msg 自动填 `Session-Id`（amend 与显式 `--trailer` 均不会叠加第二个 id）；无状态文件的 checkout 才需手动 `--trailer`。
+  - **已实测的绕过面**（hook 管不到，靠约定）：`revert` 与 `cherry-pick` 不触发 commit-msg——cherry-pick 会沿用原提交的 id 造成归因错配，两者都必须用 `--no-commit` 后正常提交；`commit-tree` / `--no-verify` 同样绕过；merge commit 按裁决豁免（无 id 属设计行为）。
+  - 按 id 查提交（精确匹配，勿用 grep；`separator=%x2C` 保证双 id 时两侧都查不到而不是误命中）：
+  ```bash
+  git log --all --format='%h%x09%(trailers:key=Session-Id,valueonly,separator=%x2C)%x09%s' | awk -F '\t' -v id="<id>" '$2 == id'
+  ```
+  生成、登记、compact 恢复与豁免边界的完整规则记录在来源仓库（inside-china-ai）的 commit-session-association-id 提案中；验收场景见 `scripts/test-commit-msg-hook.sh`。
+
+## 9. 并发 Session 与恢复
+
+同仓库可能有并行 session 写 git。已留档两次事故：
+
+- **2026-09-03**：两 session 竞态互挤提交，一方 rebase 回滚了另一方的磁盘文件。
+- **2026-09-14**：并行 session 在共享工作目录执行 `pull --rebase` + `push`，把我方未推送的提交一并搬上远端（SHA 全变）；我方随后的 `--amend` 落在它刚落下的提交上，替换掉它的提交信息、把它的内容并入我方 commit（它第二次 rebase 才整理干净），并把共享目录切到它自己的分支。无内容丢失，但重复的提交信息已发布、无法不改写历史地修复。
+
+1. 检测到对方操作进行中（reflog 持续推进、存在 rebase 目录）时等待其停滞，期间不写任何 ref。
+2. 竞态应急（你的提交被并行挤出、或必须在不动共享工作区与 index 的前提下提交）按 `docs/agents/git-concurrent-recovery.md` 的配方执行；该路径绕过 commit hooks 与 §4 校验，完成后须按配方对齐 index。可预判的并行任务直接按第 3 条用 worktree，不走应急路径。
+3. **写入者独占**是并行工作的默认规则：写入型并行 session 用 `bash scripts/session-launcher.sh start <task>` 开工——一条命令建独立 worktree（含 worktree 专属的绝对 hooksPath，hooks 在其中正常生效）、生成并登记 Session-Id、写 per-session 状态文件。此后该 worktree 内 `git commit -m` 自动带 trailer（prepare-commit-msg 填写），ref-gate 对"丢弃外会话 commit"的非快进 ref 操作进入拦截模式——**拦截判据已扩到「存在第二个 worktree」**（并行写入者的证据，本 checkout 无需 state file；2026-09-14 事故的防线）。分支删除（`git branch -d/-D`）始终只警告；实测该操作只以 `aborted` 阶段到达 hook，故删除**不在门控覆盖内**，`-D` 未合并分支仍会静默毁掉工作。共享工作目录即共享 staging 区，是并行冲突的根因。把 `pull --rebase`、`push`、`switch` 留在你自己的 worktree 内——在共享目录执行它们会搬走他人未推送的提交，或把工作区切到他人分支（2026-09-14 事故）。launcher 不可用时退回手动 `git worktree add` + §8 手动 trailer；收尾 `bash scripts/session-launcher.sh stop <worktree-path>`。纯只读探索可共享目录；互不重叠文件的轻量任务（1–2 个文件）可留在主目录，仍走 §1 选择性 staging。
+4. 目标文件已有非本 session 的未提交改动时，本 session 停止并报告，由用户决定落库顺序。应急配方的临时 index 只覆盖互不重叠的文件——同文件交叠时 `git add` 会把混合内容装进树。
+5. **写 ref 前紧邻复核身份**（2026-09-14 事故的直接防线）：
+   - `commit` / `amend` / `reset` / `rebase` 前，在同一批命令里先取 `git rev-parse HEAD` 与 `git diff --cached --name-only`，与预期不符即停止并报告；`git rev-parse --abbrev-ref HEAD` 必须是你本次任务自己的分支（launcher worktree 内为该任务分支）。
+   - 判据取 HEAD 本身：`git status` 只看工作区与索引，HEAD 被他人 rebase 后它照样显示「干净」——上一轮复核（如 amend 目标）之后到写 ref 之间仍是窗口。
+   - 共享目录被他人切走分支时，切回由该目录当前所有者执行；你在自己的 worktree 继续。
+   - commit 后立即 `git show --stat HEAD`（§4.6）核对文件清单只含本任务文件。

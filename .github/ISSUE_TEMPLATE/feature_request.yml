@@ -1,0 +1,35 @@
+name: 功能请求
+description: 新功能或对现有流程的改进
+labels: ["enhancement", "needs-triage"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: 要解决的问题
+      description: 从使用者视角描述痛点，而不是直接给方案。
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 期望方案
+      description: 可选；有倾向就写，没有留给 triage。
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: 验收标准
+      description: 完成后如何机械核验（退出码/台账字段/测试）。
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: 影响面
+      options:
+        - "area:pipeline（投递/追踪链路）"
+        - "area:platforms（平台适配）"
+        - "area:agent-harness（hooks/agent 文档）"
+        - "area:webui"
+        - "area:docs"
+    validations:
+      required: true

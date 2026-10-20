@@ -1,0 +1,24 @@
+# .gitleaks.toml — secret scanning for the public snapshot
+#
+# 本仓不含任何真实凭据：登录态与台账都在 private/（已被 .gitignore 排除）。
+# 这份配置保持最小——出现命中就当作「不该入库」处理，而不是往 allowlist 里加值。
+#
+# Usage:
+#   gitleaks detect --no-git --source . --config .gitleaks.toml   # 全量（无 git 目录时）
+#   gitleaks protect --staged --config .gitleaks.toml             # staged（pre-commit 用）
+
+[extend]
+  useDefault = true
+
+[allowlist]
+  description = "Documentation and test fixtures that are secret-shaped by design"
+  paths = [
+    '''PRIVACY\.md''',
+    '''scripts/test_logging\.py''',
+    '''scripts/check_public_boundary\.py''',
+  ]
+  regexes = [
+    '''138\*{4}\d{4}''',
+    '''x\*+@y\.com''',
+    '''user:secret@127\.0\.0\.1''',
+  ]

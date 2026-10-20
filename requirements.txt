@@ -1,0 +1,7 @@
+# 运行时依赖（== 固定版本；升级由 renovate 提案，minimumReleaseAge=7 天延迟采纳）
+camoufox==0.5.5
+# 以下两个是 portfolio_survey.py 的直接依赖（deptry DEP003 修复后显式声明）
+lxml==6.1.2
+pdfplumber==0.11.10
+# playwright 本身不被脚本直接 import（经 camoufox 传递），显式固定保证浏览器引擎版本一致
+playwright==1.60.0
