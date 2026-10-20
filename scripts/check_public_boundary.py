@@ -24,6 +24,7 @@ MARKER = "pii-ok"
 
 BANNED_PATHS = [
     re.compile(r"^private/"),
+    re.compile(r"^private$"),  # 软链同样不能入库：`private/` 只挡目录
     re.compile(r"^scripts/oneshot/"),
     re.compile(r"(?i)\.(pdf|docx?|xlsx?|pptx?|png|jpe?g|gif|webp|heic|mp4|webm|mov|avi|sqlite3?|zip|tar\.gz)$"),
     re.compile(r"(?i)(^|/)(app|apply_log)\.log$"),
@@ -63,7 +64,6 @@ SAFE_EMAIL_DOMAINS = {
     "example",
 }
 SAFE_PATH_USERS = {"example", "user", "runner", "pablo", "<user>", "name"}
-SAFE_MOBILE = {"13812345678", "13800138000", "13900139000", "15000000000", "18888888888"}
 
 
 def mask(value: str) -> str:
@@ -155,8 +155,6 @@ def check_content(files: list[str], denylist: list[str], findings: list[str]) ->
                 for match in rx.finditer(line):
                     value = match.group(0)
                     if kind == "resume_file" and value.lower().startswith(("sample_", "example_")):
-                        continue
-                    if kind == "cn_mobile" and value in SAFE_MOBILE:
                         continue
                     if kind == "email" and value.split("@", 1)[1].lower() in SAFE_EMAIL_DOMAINS:
                         continue

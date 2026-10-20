@@ -30,7 +30,9 @@ def _read_lines(p):
 
 def test_scrub_phone_partial_mask():
     """11 位手机号掩码保留首 3 末 4，便于排障辨认。"""
-    assert _lg.scrub_text("联系方式 13812345678，下午聊") == "联系方式 138****5678，下午聊"
+    assert (
+        _lg.scrub_text("联系方式 13812345678，下午聊") == "联系方式 138****5678，下午聊"  # pii-ok：脱敏器夹具，形状与真实手机号一致
+    )
 
 
 def test_epoch_ms_and_short_digits_not_masked():
@@ -72,7 +74,9 @@ def test_scrub_value_masks_sensitive_keys():
 
 def test_scrub_value_recursive_and_types():
     """递归脱敏嵌套结构；int/bool/None 原样（时间戳等非字符串零风险）。"""
-    v = _lg.scrub_value({"a": ["13812345678"], "b": {"c": "x@y.com"}, "n": 1726848000000, "t": True, "none": None})
+    v = _lg.scrub_value(
+        {"a": ["13812345678"], "b": {"c": "x@y.com"}, "n": 1726848000000, "t": True, "none": None}  # pii-ok：脱敏器夹具，形状与真实手机号一致
+    )
     assert v == {"a": ["138****5678"], "b": {"c": "x***@y.com"}, "n": 1726848000000, "t": True, "none": None}
 
 
@@ -84,7 +88,9 @@ def test_log_event_writes_jsonl_when_enabled(tmp_path, monkeypatch):
     p = tmp_path / "app.log"
     monkeypatch.setenv("AUTOJOB_LOG_PATH", str(p))
     monkeypatch.setenv("AUTOJOB_STRUCTURED_LOG", "1")
-    _lg.log_event("greeting_applied", job="RAG 平台工程师", brand="灼识科技", contact="13812345678")
+    _lg.log_event(
+        "greeting_applied", job="RAG 平台工程师", brand="灼识科技", contact="13812345678"  # pii-ok：脱敏器夹具，形状与真实手机号一致
+    )
     recs = _read_lines(p)
     assert len(recs) == 1
     assert recs[0]["event"] == "greeting_applied"
