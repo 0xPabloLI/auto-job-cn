@@ -4,8 +4,14 @@
 - 状态判定单一真源 = conv.status（#30 修复后）：最后一条消息 fromId 是我方 = awaiting
   （[已读]/[送达] 都不算回复），对方发言 = hr_replied——不再按摘要前缀猜
 - 数据源：wapi getGeekFriendList 拦截为主（结构化全量，带 encryptJobId/毫秒时间戳），
-  结构化 DOM 降级；探测结论 内部调研笔记（未随本仓分发）
+  结构化 DOM 降级；探测结论 内部调研笔记目录（未随本仓分发）boss-chat-card-shape.md
 - 解析与统计逻辑在 scripts/platforms/chat_first.py；本脚本只做编排、标注持久化与展示
+- 水位线读数（#75「先看哪几条」）：报告里的 `newSinceWatermark` / `watermark` 与终端那行
+  `[水位线]` 都来自 `scripts/_inbound_watermark.py`（经 `wm.attach_readings` 落键，与
+  `reply_inbound` / `live_apply` 同一个函数）。**本脚本只读消费者**——读基准、报差值，
+  绝不推进它（推进只发生在 `reply_inbound.py --mark-read`，语义是用户当面确认看过这次读到的整批）。
+  Boss 的 `unreadMsgCount` 已被实测否证（场次与证据见 `内部调研笔记目录（未随本仓分发）boss-chat-card-shape.md` §7.3），
+  所以这里也不拿它分类。
 
 标注模式（#19 Loop Evaluation）：
   python3 scripts/followup_tracker.py annotate --annotations FILE
@@ -25,7 +31,13 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from platforms import get_platform
+from platforms.chat_first import (  # noqa: E402  #判据与中文标签都在 平台侧（单一真源），本脚本只做编排与展示
+    STATE_LABELS,
+    inbound_waiting,
+    read_state,
+)
 import _logging  # noqa: E402  #38 机读日志旁路（双轨制：print 人读层与测试契约不动）
+import _inbound_watermark as wm  # noqa: E402  #75 水位线判据在单一真源里，本脚本只读、只报、不推进
 from _profile_paths import (  # noqa: E402  #28：私有路径唯一出口
     browser_profile_dir,
     private_path,
@@ -156,6 +168,9 @@ def run():
     print(profile_line(name, prefix))
     history_path = private_path("data/applied_history.json", prefix)
     out_path = private_path("data/followup_report.json", prefix)
+    # 水位线基准按 profile 隔离（#28 扁平命名）。本脚本是**只读消费者**：读它、报它，一个字都不写
+    # ——推进只发生在 `reply_inbound.py --mark-read`（用户当面确认「这批我看过了」那一刻）。
+    watermark_path = private_path(wm.WATERMARK_FILE, prefix)
     platform = get_platform()
     with open(history_path, encoding="utf-8") as f:
         applied = json.load(f).get("applied", [])
@@ -183,10 +198,15 @@ def run():
         print(f"[warn] 采集到 0 条对话（疑似登录态过期/掉线）——沿用上次报告，不覆盖 {out_path}")
         return
 
+    # 水位线读数（#75）：拿本场只读快照与上次基准比，两个恒在键就地落进 report。
+    # 判据、形态、措辞与「怎么落键」都在 `_inbound_watermark.attach_readings`（条目 B：三个消费者
+    # 共用一个函数，免得各自接一遍接漏），这里只接线 + 打印。无基准时 N 是 None（**不是**全部条数）。
+    base, due = wm.attach_readings(report, profile=name, path=watermark_path)
+
     replied = [r for r in report["conversations"] if r["status"] == "hr_replied"]
     awaiting = [r for r in report["conversations"] if r["status"] == "awaiting"]
     # 入站且在等回话：末条是对方发言、又归不到我们的投递记录（对方主动来撩的那批）
-    unlinked_replied = [r for r in replied if not r["appliedJob"]]
+    unlinked_replied = inbound_waiting(report["conversations"])
 
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(report, f, ensure_ascii=False, indent=2)
@@ -205,14 +225,43 @@ def run():
         linked_replied=report["linkedReplied"],
         unlinked=report["unlinkedConversations"],
         unlinked_replied=report["unlinkedReplied"],
+        unread_conversations=report["unreadConversations"],
+        unlinked_replied_unread=report["unlinkedRepliedUnread"],
+        unlinked_replied_read=report["unlinkedRepliedRead"],
+        unlinked_replied_read_unknown=report["unlinkedRepliedReadUnknown"],
+        new_since_watermark=report["newSinceWatermark"],
+        watermark_state=report["watermark"]["state"],
     )
     print(f"[关联投递记录] {report['linkedToApplied']} 个，其中已回复 {report['linkedReplied']}")
     print(
         f"[入站线索] 归不到投递记录 {report['unlinkedConversations']} 个，"
-        f"其中 {report['unlinkedReplied']} 个末条是对方发言（在等回话；投递链路只发首封、不回复已有对话）"
+        f"其中 {report['unlinkedReplied']} 个末条是对方发言（在等回话；要回这批走"
+        " docs/agents/apply-runbook.md 的「入站回复」小节）"
     )
-    for r in unlinked_replied[:15]:
-        print(f"  ▸ {r['company']} | {r['title']} | {(r['summary'] or '（无摘要）')[:46]}")
+    # 读态分桶恒打（0 也打）：未读数**只能靠 wapi 只读字段拿**——链路不许为了分类去点开会话，
+    # 点开会话就把未读消耗掉，而这列的全部价值就是告诉人「该去读哪几条」（用户 2026-10-20 硬约束）。
+    # 三桶相加 = 上面的 unlinkedReplied；unknown 非零说明来源没给这个键（DOM 降级 / 字段漂移），
+    # 此时不要把「无未读标记」那桶读成「都看过了」。
+    # 更硬的一条：该字段在实测快照里恒 0（而其中有场次用户确认有未读——场次与证据见
+    # `内部调研笔记目录（未随本仓分发）boss-chat-card-shape.md` §7.3，本脚本不自己数）⇒ **这桶基本等于整批**，
+    # 它给不了「该读哪几条」；那件事只有 Boss 的未读徽标知道，要人去看（reply_inbound.read_state 注释）。
+    print(
+        f"        其中有未读标记 {report['unlinkedRepliedUnread']} / 无未读标记 {report['unlinkedRepliedRead']} / "
+        f"读态未知 {report['unlinkedRepliedReadUnknown']}"
+    )
+    # 上面那三桶给不了「先看哪几条」，这条才是（#75）：自己记的水位线，只读数之间的差。
+    print(wm.headline(base, due))
+    # 全列不设上限、长文行尾补 `…`（#66 验收 1）：行数必须等于上面的 `unlinkedReplied`——这批就是
+    # 待办清单本身，截 15 行会静默丢掉等回话的线索，而静默截断又会被读成「对方就说完了」。
+    window = 46
+    for r in unlinked_replied:
+        sm = r["summary"] or "（无摘要）"
+        # 「｜线上新」只挂在**线上**那几条末尾（不前移徽标、不改 `…` 的位置——那两样是 #66 的用例契约）。
+        above = " ｜线上新" if wm.above_line(r, base, report.get("myUserId")) else ""
+        print(
+            f"  ▸ [{STATE_LABELS[read_state(r)]}] {r['company']} | {r['title']} | {sm[:window]}"
+            f"{'…' if len(sm) > window else ''}{above}"
+        )
     print()
     print("=== HR 已回复的对话 ===")
     for r in replied:

@@ -26,6 +26,8 @@
   salary floor, target industry, real company/HR names, platform probing notes) live only
   under `private/` and never get committed, logged or quoted. Before any commit or release,
   run `python3 scripts/check_public_boundary.py` (also wired into `.githooks/pre-commit`).
+- Public repo is generated, not edited: promote with `python3 /path/to/user/Documents/code/.auto-job-publish/promote_public.py`
+  （私有主线 → 脱敏快照 → 全闸门 → 用户确认 → push）。绝不手改公开 checkout，也不把私有提交直接推 public。
 
 ## Collaboration Preferences
 
@@ -60,3 +62,5 @@ profile 先查注册表，查不到就问，不代猜；未指名用 default**�
 用户说「投简历 / 实时投简历 / 开始投简历」都走 live_apply 实时浏览投递——这是唯一的投递路径
 （2026-09-10 用户约定：挂机 backup 链路已从流程移除，不再有挂机模式）。均按 runbook 执行
 （→ followup+learn → 汇报）。See `docs/agents/apply-runbook.md`.
+用户说「回复入站 / 回那批来找我们的」走同一份 runbook 的「入站回复」小节
+（`scripts/reply_inbound.py`，#66 阶段 2：默认 dry-run 零点击，发送需当次授权）。

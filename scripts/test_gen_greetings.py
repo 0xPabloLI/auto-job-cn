@@ -51,9 +51,9 @@ def test_promote_replaces_same_job_keeps_order():
 def test_promote_passes_contact_fields():
     """issue #12：姓名/抬头要透传到投递队列，发送时拼个性化称呼。"""
     d = _draft("a", status="approved", greeting="ok")
-    d.update({"bossName": "潘女士", "bossTitle": "HR"})
+    d.update({"bossName": "汐女士", "bossTitle": "HR"})
     greetings, _, _ = mod.promote_drafts([d], [])
-    assert greetings[0]["bossName"] == "潘女士"
+    assert greetings[0]["bossName"] == "汐女士"
     assert greetings[0]["bossTitle"] == "HR"
 
 
@@ -128,7 +128,7 @@ def test_cmd_promote_reports_kept_sent(tmp_path, capsys, monkeypatch):
 
 
 def test_match_brand_substring_both_ways():
-    assert mod.match_brand("袁女士上海珀澜科技HR", "上海珀澜科技")
+    assert mod.match_brand("桐女士上海珀澜科技HR", "上海珀澜科技")
     assert mod.match_brand("珀淞区块链", "北京珀淞区块链有限公司")
     assert not mod.match_brand("A公司", "B公司")
     assert not mod.match_brand("短", "短")  # 长度守卫
@@ -139,7 +139,7 @@ def test_build_memory_replied_detection():
         "totalConversations": 3,
         "hrReplied": 1,
         "conversations": [
-            {"company": "袁女士上海珀澜科技HR", "summary": "[送达] 7年Solidity", "status": "awaiting"},
+            {"company": "桐女士上海珀澜科技HR", "summary": "[送达] 7年Solidity", "status": "awaiting"},
             {"company": "上海珀澜科技有限公司HR", "summary": "好的，聊聊", "status": "hr_replied"},
             {"company": "珀淞区块链HR", "summary": "方便发简历吗", "status": "hr_replied"},
         ],
@@ -616,8 +616,8 @@ def test_join_eval_records_brand_fallback_1to1_consumption():
     会造成样本数膨胀/笛卡尔积，已配对的对话不再参与后续兜底。"""
     report = {
         "conversations": [
-            {"company": "甲子光年公司HR潘女士", "summary": "聊聊？", "status": "hr_replied"},
-            {"company": "甲子光年公司HR花先生", "summary": "[送达]", "status": "awaiting"},
+            {"company": "甲子光年公司HR汐女士", "summary": "聊聊？", "status": "hr_replied"},
+            {"company": "甲子光年公司HR蒹先生", "summary": "[送达]", "status": "awaiting"},
         ]
     }
     greetings = [
@@ -1513,11 +1513,11 @@ def test_record_session_snapshot_appends_growth_after_nonzero_history(tmp_path):
 
 
 def test_annotation_for_conv_prefers_encrypt_job_id():
-    # #32 段 2：同 eid 两轮采集 company 串漂移（潘女士煦辰招聘者 → 潘女士），eid 优先防失配
-    conv = {"company": "潘女士", "encryptJobId": "eid1"}
+    # #32 段 2：同 eid 两轮采集 company 串漂移（汐女士煦辰招聘者 → 汐女士），eid 优先防失配
+    conv = {"company": "汐女士", "encryptJobId": "eid1"}
     anns = [
-        {"company": "潘女士", "replyCategory": "no_reply"},
-        {"company": "潘女士煦辰招聘者", "encryptJobId": "eid1", "replyCategory": "interested"},
+        {"company": "汐女士", "replyCategory": "no_reply"},
+        {"company": "汐女士煦辰招聘者", "encryptJobId": "eid1", "replyCategory": "interested"},
     ]
     assert mod.annotation_for_conv(conv, anns)["replyCategory"] == "interested"
 

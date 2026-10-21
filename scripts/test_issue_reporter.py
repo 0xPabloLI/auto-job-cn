@@ -18,12 +18,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import _issue_reporter as ir  # noqa: E402
 
 
-@pytest.fixture(autouse=True)
-def _issue_repo(monkeypatch):
-    """开票目标仓由 env 给定：测试不依赖运行机器上的 git remote。"""
-    monkeypatch.setenv("AUTOJOB_ISSUE_REPO", "0xExample/auto-job-cn")
-
-
 # --- 草稿渲染与脱敏纪律（票面：正文只含 breaker 类型、计数、阈值、session ID） ---
 
 

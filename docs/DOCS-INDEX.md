@@ -32,7 +32,8 @@
 
 | Document                                   | Purpose                                                                     | Referenced by                              |
 | ------------------------------------------ | ---------------------------------------------------------------------------- | ------------------------------------------ |
-| `docs/agents/apply-runbook.md`             | 投递 Runbook（prompt 驱动）— 「开始投简历」触发的标准执行步骤                  | AGENTS.md / 用户说开始投简历时             |
+| `CONTEXT.md`                             | 领域术语表（入站 / 在等回话 / 已读未回 / 消耗未读 / 水位线 / 招呼语台账 vs 回复台账）— 自造词进文档或用户追问用词含义时先读 | AGENTS.md Domain language / #75 |
+| `docs/agents/apply-runbook.md`             | 投递 Runbook（prompt 驱动）— 「开始投简历」的标准执行步骤 + 「入站回复」动作面（#66 阶段 2）  | AGENTS.md / 用户说开始投简历、回复入站时             |
 | `docs/agents/apply-forensics.md`           | 投递取证与跳岗台账（卡死三份证据的读法与四格判读）— 会话被看门狗击杀时才读        | apply-runbook 阅读路径 / `scripts/_forensics.py` |
 | `docs/agents/apply-tuning.md`              | 投递节奏与额度调档（会话级开关 + 日上限阶梯）— 要偏离默认或降档时才读             | apply-runbook 阅读路径 / 步骤 1                   |
 | `docs/agents/integration-smoke.md`         | 集成/E2E 冒烟步骤 — dry-run 到发送前 gate（零发送，agent 可跑）/ 真实限量冒烟（人工留证）（#40） | #40 人工触发 / Wave 准出门禁 / live_apply 改动回归 |

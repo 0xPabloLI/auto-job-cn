@@ -72,16 +72,16 @@ def test_stub_platforms_not_implemented(name):
 
 # --- ChatFirstPlatform 纯函数：followup 对话解析（#30 修复：字段来源从整卡 innerText 猜行
 # --- 改为 wapi 结构化直取 + 结构化 DOM 降级；fixture 为 2026-09-12 真实登录探针 dump，
-# --- 见 内部调研笔记（未随本仓分发）。旧合成串 fixture 与解析器假设同源，已废。） ---
+# --- 见 内部调研笔记目录（未随本仓分发）boss-chat-card-shape.md。旧合成串 fixture 与解析器假设同源，已废。） ---
 
 PLATFORM = platforms.get_platform("chat-first")
 
 # wapi getGeekFriendList.json 条目（真实响应节选，仅裁剪 securityId/avatar 等无关长字段）
 WAPI_MINE_READ = {  # 我方最后发言且对方已读——旧解析把这条误判成 hr_replied（[已读]≠回复）
-    "name": "严先生",
+    "name": "壬先生",
     "brandName": "煦珩人力",
     "title": "猎头顾问",
-    "lastMsg": "严先生你好，我有7年Solidity智能合约开发经验，深耕DeFi衍生品协议设计。",
+    "lastMsg": "壬先生你好，我有7年Solidity智能合约开发经验，深耕DeFi衍生品协议设计。",
     "lastTime": "昨天",
     "lastTS": 1789097252186,
     "lastMessageInfo": {"fromId": 780045835, "toId": 626134785, "status": 2, "msgTime": 1789097252186},
@@ -98,7 +98,7 @@ WAPI_MINE_DELIVERED = {  # 我方最后发言未读（[送达]）
     "encryptJobId": "40cde3336736a7a30nF93Ni1EVBQ",
 }
 WAPI_HR_REPLY = {  # HR 最后发言（真实回复文本）
-    "name": "潘女士",
+    "name": "汐女士",
     "brandName": "煦辰",
     "title": "招聘者",
     "lastMsg": "对你的简历很感兴趣，期待深入交流。",
@@ -111,24 +111,24 @@ WAPI_HR_REPLY = {  # HR 最后发言（真实回复文本）
 # 结构化 DOM 卡片（真实 dump：li[role=listitem] 下的 .time/.name-text/.message-status/.last-msg-text）
 DOM_CHIP = {  # 带状态徽标 = 我方最后发言
     "time": "昨天",
-    "name": "严先生",
-    "name_box": "严先生煦珩人力猎头顾问",
+    "name": "壬先生",
+    "name_box": "壬先生煦珩人力猎头顾问",
     "status": "[已读]",
     "status_read": True,
-    "last_msg": "严先生你好，我有7年Solidity智能合约开发经验，深耕DeFi衍生品协议设计。",
+    "last_msg": "壬先生你好，我有7年Solidity智能合约开发经验，深耕DeFi衍生品协议设计。",
 }
 DOM_NO_CHIP = {  # 无徽标 = HR 最后发言
     "time": "09月09日",
-    "name": "潘女士",
-    "name_box": "潘女士煦辰招聘者",
+    "name": "汐女士",
+    "name_box": "汐女士煦辰招聘者",
     "status": None,
     "status_read": False,
     "last_msg": "对你的简历很感兴趣，期待深入交流。",
 }
 DOM_NO_CHIP_2 = {  # 无徽标，品牌 4 字（match_brand min_len 下限之上，可回填）
     "time": "09月08日",
-    "name": "汤女士",
-    "name_box": "汤女士昀洵网络人事专员",
+    "name": "澄女士",
+    "name_box": "澄女士昀洵网络人事专员",
     "status": None,
     "status_read": False,
     "last_msg": "简历已收到，合适会联系您[抱拳]",
@@ -138,15 +138,56 @@ DOM_NO_CHIP_2 = {  # 无徽标，品牌 4 字（match_brand min_len 下限之上
 def test_parse_friend_entries_field_mapping_and_compat_company():
     out = chat_mod.parse_friend_entries([WAPI_MINE_READ], my_user_id=780045835)
     c = out[0]
-    assert c["name"] == "严先生", "name 是联系人，不再是时间样式（#30 验收 1）"
-    assert c["company"] == "严先生煦珩人力猎头顾问", "company 沿用旧粘连语义（reply_annotations 匹配键不变）"
+    assert c["name"] == "壬先生", "name 是联系人，不再是时间样式（#30 验收 1）"
+    assert c["company"] == "壬先生煦珩人力猎头顾问", "company 沿用旧粘连语义（reply_annotations 匹配键不变）"
     assert c["brandName"] == "煦珩人力"
     assert c["title"] == "猎头顾问"
-    assert c["summary"].startswith("严先生你好")
+    assert c["summary"].startswith("壬先生你好")
     assert c["time"].startswith("2026-09-11"), "time 是真实时间戳，不再是消息正文（#30 验收 2）"
     assert c["lastTime"] == "昨天"
     assert c["encryptJobId"] == "45167fe4a07eec100nF93Ni1EVBQ"
     assert c["source"] == "wapi"
+
+
+def test_parse_friend_entries_carries_deeplink_ids_and_last_ts():
+    """#73：聊天页深链与发送后的 wapi 回读都靠这几个字段，必须从原始条目**原样透传**——
+    `encryptUid`（深链首选）、`encryptBossId`（缺失时兜底）、数字 `uid`（落地 URL 校验的
+    第三形态）、`lastTS`（回读时判「时间前进了」的对照点）、`lastMessageInfo.fromId`（判末条
+    是不是我们发的）。卡片渲染与否与它们无关，这也是本条链路能绕开 40/68 渲染上限的原因。"""
+    entry = {
+        **WAPI_HR_REPLY,
+        "encryptUid": "enc-uid-1",
+        "encryptBossId": "enc-boss-1",
+        "uid": 740868320,
+    }
+    c = chat_mod.parse_friend_entries([entry], my_user_id=780045835)[0]
+    assert c["encryptUid"] == "enc-uid-1"
+    assert c["encryptBossId"] == "enc-boss-1"
+    assert c["bossUid"] == 740868320, "数字 uid 单独一个键，不许和两个加密 id 混用"
+    assert c["lastTS"] == WAPI_HR_REPLY["lastTS"], "原始毫秒时间戳，不取展示串 `time`"
+    assert c["lastFromId"] == 740868320
+
+
+def test_parse_friend_entries_zero_last_ts_is_passed_through():
+    """`lastTS=0` 原样透传（回读时的对照点可以是 0，不必洗成 None 之外的怪值）。"""
+    c = chat_mod.parse_friend_entries([{**WAPI_HR_REPLY, "lastTS": 0}])[0]
+    assert c["lastTS"] == 0
+
+
+def test_parse_friend_entries_missing_message_info_has_no_from_id():
+    no_payload = {"name": "己女士", "encryptJobId": "eid1", "lastMsg": None, "lastMessageInfo": None}
+    c = chat_mod.parse_friend_entries([no_payload], my_user_id=780045835)[0]
+    assert c["lastFromId"] is None, "没有消息体就没有 fromId，不猜成我方"
+
+
+def test_parse_dom_cards_have_no_deeplink_fields():
+    """DOM 降级路径没有加密 id / 原始时间戳（卡片只有展示串），一律 None——不许拿文案编一个。"""
+    c = chat_mod.parse_dom_cards([DOM_NO_CHIP], applied=[])[0]
+    assert c["encryptUid"] is None
+    assert c["encryptBossId"] is None
+    assert c["bossUid"] is None
+    assert c["lastTS"] is None
+    assert c["lastFromId"] is None
 
 
 def test_parse_friend_entries_read_is_not_reply():
@@ -168,7 +209,7 @@ def test_parse_friend_entries_missing_message_info_is_awaiting():
     """2026-09-24 修复：lastMessageInfo 整体缺失（wapi 未 hydrate，实测 3 条）⇒ 无「对方
     回复」证据，保守归 awaiting——旧逻辑空体默认 False → hr_replied，假阳性污染 replied 统计。"""
     no_payload = {
-        "name": "吕女士",
+        "name": "己女士",
         "brandName": "煦昱金创",
         "title": "HRBP",
         "encryptJobId": "eid1",
@@ -192,8 +233,8 @@ def test_parse_dom_cards_semantics():
     out = chat_mod.parse_dom_cards([DOM_CHIP, DOM_NO_CHIP], applied=[])
     mine, hr = out
     assert mine["status"] == "awaiting" and mine["is_read"] is True
-    assert mine["company"] == "严先生煦珩人力猎头顾问"
-    assert mine["name"] == "严先生"
+    assert mine["company"] == "壬先生煦珩人力猎头顾问"
+    assert mine["name"] == "壬先生"
     assert mine["time"] == "昨天", "DOM 路径只有展示串时间"
     assert mine["source"] == "dom"
     assert hr["status"] == "hr_replied" and hr["is_read"] is False
@@ -206,6 +247,209 @@ def test_parse_dom_cards_unique_brand_match_backfills_job():
     out = chat_mod.parse_dom_cards([DOM_NO_CHIP_2], applied=applied)
     assert out[0]["appliedJob"] == "Web3安全工程师"
     assert out[0]["encryptJobId"] == "e1"
+
+
+# --- #66 阶段 2：读态三格（有未读 / 无未读标记 / 未知）进读数 ---
+# 注：10-21 实测该字段在真机上恒 0（用户确认有未读时也是 0），所以它给不了「该读哪几条」；
+# 下面的用例钉的是**三态不混**（未知不得并入 0），不是钉它可用。
+# 硬约束来源（用户 2026-10-20）：链路不得消耗未读标记，所以未读数必须是**只读拿到的**，
+# 而不是点开之后剩下的。据此，`unreadMsgCount` 的三态不能压成布尔：
+# 0＝确实无未读（已读），>0＝还没读，**None＝这一条的来源根本没给**（DOM 降级、或 wapi
+# 形态漂移）。把 None 当 0 会把「不知道」谎报成「都读过了」——正是用户要避免的那种损失。
+
+
+def test_parse_friend_entries_carries_unread_count():
+    """wapi 条目自带 `unreadMsgCount`（2026-09-12 快照 61/61 条都有这个键，当时全为 0）。
+    非零照实落，0 照实落，**键缺失落 None 而不是 0**。"""
+    base = dict(WAPI_HR_REPLY)
+    assert chat_mod.parse_friend_entries([{**base, "unreadMsgCount": 3}])[0]["unreadMsgCount"] == 3
+    assert chat_mod.parse_friend_entries([{**base, "unreadMsgCount": 0}])[0]["unreadMsgCount"] == 0
+    no_key = {k: v for k, v in base.items() if k != "unreadMsgCount"}
+    assert chat_mod.parse_friend_entries([no_key])[0]["unreadMsgCount"] is None, "键缺失=读态未知，不许当已读"
+
+
+def test_parse_dom_cards_unread_state_is_unknown():
+    """DOM 降级路径没有未读数（卡片只有时间/姓名/徽标/正文四样），必须报未知。"""
+    out = chat_mod.parse_dom_cards([DOM_NO_CHIP], applied=[])
+    assert out[0]["unreadMsgCount"] is None
+
+
+def test_build_report_splits_inbound_waiting_by_read_state():
+    """入站且在等回话的那批按读态分桶，且**三桶相加等于 unlinkedReplied**——
+    否则「有未读 N / 无未读标记 M」的读数不可核对，未知被静默吞进某一桶。"""
+    convs = [
+        {"status": "hr_replied", "appliedJob": None, "unreadMsgCount": 2},  # 未读
+        {"status": "hr_replied", "appliedJob": None, "unreadMsgCount": 0},  # 无未读标记
+        {"status": "hr_replied", "appliedJob": None, "unreadMsgCount": None},  # 未知
+        {"status": "awaiting", "appliedJob": None, "unreadMsgCount": 5},  # 末条我方，不入分桶
+        {"status": "hr_replied", "appliedJob": "投过的岗", "unreadMsgCount": 7},  # 已关联，不入分桶
+    ]
+    report = chat_mod.build_report(convs, generated_at="2026-10-20 12:00:00")
+    assert report["unlinkedReplied"] == 3
+    assert report["unlinkedRepliedUnread"] == 1
+    assert report["unlinkedRepliedRead"] == 1
+    assert report["unlinkedRepliedReadUnknown"] == 1
+    assert (
+        report["unlinkedRepliedUnread"] + report["unlinkedRepliedRead"] + report["unlinkedRepliedReadUnknown"]
+        == report["unlinkedReplied"]
+    )
+    assert report["unreadConversations"] == 3, "含我方末条那条（unread=5）也算未读，分桶只看有没有未读"
+
+
+def test_build_report_read_state_keys_always_present():
+    """老会话记录没这个键（历史 followup_report.json 回放）不得 KeyError——恒在且全 0/未知。"""
+    report = chat_mod.build_report([{"status": "awaiting", "appliedJob": "A"}], generated_at="2026-10-20 00:00:00")
+    assert report["unreadConversations"] == 0
+    assert report["unlinkedRepliedUnread"] == 0
+    assert report["unlinkedRepliedRead"] == 0
+    assert report["unlinkedRepliedReadUnknown"] == 0
+
+
+def test_build_report_carries_my_user_id():
+    """#73：发送后的 wapi 回读要判「末条 fromId 是不是我方」，而 userId 只有采集那一刻知道
+    （`getUserInfo` 响应）⇒ 必须跟着报告一起出来，不能靠回读时的 ctx 再去猜。"""
+    assert chat_mod.build_report([], generated_at="2026-10-20 00:00:00", my_user_id=780045835)["myUserId"] == 780045835
+    assert chat_mod.build_report([], generated_at="2026-10-20 00:00:00")["myUserId"] is None
+
+
+def test_chat_url_for_quotes_the_id():
+    """#73 深链：`/web/geek/chat?id=<招聘者加密 id>`。id 是站点给的串（可能含 `/`、`+`、`=`），
+    必须整体 quote——裸拼会把 query 拆坏，落地成另一个人的会话或空页。"""
+    assert chat_mod.chat_url_for("45167fe4a07eec100nF93Ni1EVBQ") == (
+        "https://www.zhipin.com/web/geek/chat?id=45167fe4a07eec100nF93Ni1EVBQ"
+    )
+    assert chat_mod.chat_url_for("a b/c&d=e") == "https://www.zhipin.com/web/geek/chat?id=a%20b%2Fc%26d%3De"
+    assert chat_mod.chat_url_for(740868320) == "https://www.zhipin.com/web/geek/chat?id=740868320", (
+        "函数只做编码；数字 id 能否作为深链由站点决定，本链路不拿它当来源"
+    )
+
+
+# --- #66 阶段 2 归属守卫：入站对话绑的 encryptJobId 现在到底还是不是一个岗位页 ---
+# 判据形状全部取自今日实测（`private/data/probe/inbound_coverage_v2_20261020-120316.json`，
+# 16 条入站逐条读详情页 document.title），不是凭空列的词。
+
+
+class _FakeDetailPage:
+    """详情页替身：只实现 `job_identity` 真正会碰的四件事（goto / title / url / query_selector）。
+
+    `titles` 是逐次返回的标题序列，模拟「title 水合前是空串」那段轮询。"""
+
+    def __init__(
+        self, titles=("", "综合管理岗招聘_某公司招聘-BOSS直聘"), url="https://www.zhipin.com/job_detail/e1.html"
+    ):
+        self._titles = list(titles)
+        self.url = url
+        self.goto_urls = []
+        self.waited = []
+
+    def goto(self, url, **kwargs):
+        self.goto_urls.append(url)
+
+    def title(self):
+        return self._titles.pop(0) if len(self._titles) > 1 else (self._titles[0] if self._titles else "")
+
+    def wait_for_timeout(self, ms):
+        self.waited.append(ms)
+
+    def query_selector(self, sel):
+        return None
+
+
+def test_clean_job_title_strips_only_the_shell():
+    """BOSS 的 title 真形是 `「岗位名」_品牌名招聘-BOSS直聘`（今日 16 条逐条 dump 出来的形状，
+    不是设想）。只去壳（引号类符号、站名后缀、分隔符后的品牌段），**不动岗位名本身的字**——
+    「招聘」是标题的一部分，留着才能拿去搜/比对。"""
+    assert (
+        chat_mod.clean_job_title("「区块链-上市公司-六险一金-双休招聘」_四方精创招聘-BOSS直聘")
+        == "区块链-上市公司-六险一金-双休招聘"
+    )
+    assert (
+        chat_mod.clean_job_title(
+            "产品经理-数币/智能合约/银行支付工作内容_岑淞覃邝2026年产品经理-数币/智能合约/银行支付工作要求-BOSS直聘"
+        )
+        == "产品经理-数币/智能合约/银行支付"
+    )
+    assert chat_mod.clean_job_title("「综合管理岗招聘」_宓昱闾笪招聘-BOSS直聘") == "综合管理岗招聘"
+    assert chat_mod.clean_job_title("   ") == ""
+
+
+def test_clean_job_title_underscore_in_title_is_known_loss():
+    """已知的**去壳副作用**：标题本身含下划线时，按 `_` 切会把它切残——今日实测
+    `「上海___部门管理招聘」_旻珀笪招聘-BOSS直聘` 洗出「上海」。这是**诚实的未知**，
+    归 unresolved（认不出是哪个岗 ⇒ 不回、只呈报），不是把它当失效岗。钉住这条是为了
+    下一个人别再以为去壳规则是无损的。"""
+    assert chat_mod.clean_job_title("「上海___部门管理招聘」_旻珀笪招聘-BOSS直聘") == "上海"
+    assert chat_mod.classify_job_identity("「上海___部门管理招聘」_旻珀笪招聘-BOSS直聘")[1] == "unresolved"
+
+
+def test_classify_job_identity_real_dead_shapes_from_today():
+    """今日 16 条里那 4 条「页面活着但已经不是岗位页」的真实形状，逐条必须判 dead。"""
+    for raw in (
+        "您访问的页面不存在-BOSS直聘",
+        "Golang是什么职位_笪曜珀闾2026年Golang前景待遇-BOSS直聘",
+        "事业部管理—双休是做什么的_昀覃岑2026年事业部管理—双休岗位职责-BOSS直聘",
+        "「什么是外企-朝九晚五-周末双休-955」昱笪旻曜曜旻笪昱笪旻2026年外企-朝九晚五-周末双休-955岗位职责-BOSS直聘",
+    ):
+        assert chat_mod.classify_job_identity(raw)[1] == "dead", f"{raw} 应判失效岗"
+
+
+def test_classify_job_identity_ok_and_generic_is_not_dead():
+    assert chat_mod.classify_job_identity("「综合管理岗招聘」_宓昱闾笪招聘-BOSS直聘")[1] == "ok"
+    # 泛化标题**不是失效**——归属守卫只问「这还是不是一个岗位页」，不问「搜不搜得到」
+    # （#66 票面那条「泛化标题 45 条深度搜不到」是搜索覆盖问题，与能不能回这条对话无关）
+    assert chat_mod.classify_job_identity("「项目负责人招聘」_知不知咨询有限公司招聘-BOSS直聘")[1] == "ok"
+    assert chat_mod.classify_job_identity("「爱博家园兼职服务员招聘」_淞邝煦昀昀煦邝淞邝招聘-BOSS直聘")[1] == "ok"
+    assert chat_mod.classify_job_identity("")[1] == "unresolved", "title 取不到＝身份未知，不许猜成 ok"
+
+
+def test_job_identity_polls_title_and_reports_state():
+    page = _FakeDetailPage(
+        titles=("", "", "「诚聘升学职业规划师，助力青年规划未来招聘」_昀覃岑煦煦岑覃昀覃岑招聘-BOSS直聘")
+    )
+    out = chat_mod.job_identity(page, "eid-abc")
+    assert page.goto_urls == [chat_mod.JOB_DETAIL_URL.format(eid="eid-abc")], "复用 JOB_DETAIL_URL，不另拼一份 URL"
+    assert out["state"] == "ok"
+    assert out["jobTitle"] == "诚聘升学职业规划师，助力青年规划未来招聘"
+    assert out["encryptJobId"] == "eid-abc"
+    assert page.waited == [chat_mod.IDENTITY_POLL_INTERVAL_MS] * 2, (
+        "前两次空 title 必须真的等过水合（不轮询也能过＝空过用例）"
+    )
+
+
+def test_job_identity_login_redirect_is_not_dead():
+    """掉登录时详情页整页变体是 `/web/user/…`（9-12 探针因此产出过「15 岗全搜不到」的假读数）。
+    这种必须报 login，**不能报 dead**——报 dead 会把登录问题洗成「岗已失效」，
+    归属守卫据此把整批入站判成不可回。"""
+    page = _FakeDetailPage(titles=("注册登录 - BOSS直聘",), url="https://www.zhipin.com/web/user/?src=job")
+    out = chat_mod.job_identity(page, "eid-abc")
+    assert out["state"] == "login", out
+    assert out["jobTitle"] == ""
+
+
+def test_job_identity_survives_goto_failure():
+    """跳转抛异常（网络/协议）⇒ state=unresolved + error 串，不往外抛。
+    调用方拿到的是一格读数，不是一枚把整场回复流程打断的异常——#38 观测层不新增失败面。"""
+
+    class _Boom(_FakeDetailPage):
+        def goto(self, url, **kwargs):
+            raise RuntimeError("net::ERR_CONNECTION_RESET")
+
+    out = chat_mod.job_identity(_Boom(), "eid-abc")
+    assert out["state"] == "unresolved"
+    assert "ERR_CONNECTION_RESET" in out["error"]
+
+
+def test_job_identity_survives_poll_failure():
+    """goto 成功但**等待那一下**抛（tab 已关/协议断）同样落 unresolved：docstring 承诺的是
+    「本函数不往外抛」，漏包这一处就会穿透 resolve_identities → _drive，整场崩掉且报告不落盘。"""
+
+    class _PollBoom(_FakeDetailPage):
+        def wait_for_timeout(self, ms):
+            raise RuntimeError("Target page, context or browser has been closed")
+
+    out = chat_mod.job_identity(_PollBoom(titles=("", "")), "eid-abc")
+    assert out["state"] == "unresolved"
+    assert "has been closed" in out["error"]
 
 
 class _FakeResp:
@@ -233,6 +477,9 @@ class _FakeChatPage:
 
     def on(self, ev, h):
         self.handlers.setdefault(ev, []).append(h)
+
+    def remove_listener(self, ev, h):
+        self.handlers.get(ev, []).remove(h)
 
     def goto(self, url, **kw):
         if not self._wapi:
@@ -310,6 +557,7 @@ def test_followup_prefers_wapi_interception(monkeypatch):
     page = _FakeChatPage()
     report = chat_mod.ChatFirstPlatform().followup(page, applied=[])
     assert report["totalConversations"] == 1
+    assert report["myUserId"] == 780045835, "#73：回读判据要用我方 userId，必须随报告出来"
     conv = report["conversations"][0]
     assert conv["source"] == "wapi"
     assert conv["status"] == "awaiting" and conv["is_read"] is True
@@ -326,7 +574,7 @@ def test_followup_falls_back_to_structured_dom(monkeypatch):
 
 
 # --- #59 轮询出口：wapi 响应**可能**分批到达（实测形态是一次调用返回全量，见
-#     内部调研笔记（未随本仓分发） §3），「第一个非空响应」会照单全收首屏 ---
+#     内部调研笔记目录（未随本仓分发）boss-chat-card-shape.md §3），「第一个非空响应」会照单全收首屏 ---
 
 
 FRIEND_LIST_URL = "https://www.zhipin.com/wapi/zprelation/friend/getGeekFriendList.json"
@@ -510,9 +758,10 @@ def test_resp_json_with_forensics_reads_body_once_and_balances_the_counter():
 def test_followup_registers_its_response_handler(monkeypatch):
     """接线证明：`page.on("response", h)` 之后 handler 进了注册表，两次派发（user/info 与
     friend/list）各留下一对 enter/exit、收尾平衡。
-    **本 handler 没有注销点**（followup 走会话末尾的聊天页，页面随后整体关闭），所以这一项
-    会一直留在 `handlers_live` 里——判读时记得收尾之后的读数天然偏高 1，它不是逐岗泄漏
-    （出处见 `chat_first.py` 里 `listener_attached(h)` 那条注释）。"""
+    **默认路径的 handler 没有注销点**（followup 走会话末尾的聊天页，页面随后整体关闭），所以
+    这一项会一直留在 `handlers_live` 里——判读时记得收尾之后的读数天然偏高 1，它不是逐岗泄漏
+    （出处见 `chat_first.py` 里 `listener_attached(h)` 那条注释）。同页重复读用 `detach=True`，
+    另见下一条用例。"""
     fx._reset_handler_forensics()
     monkeypatch.setattr(chat_mod.time, "sleep", lambda *_: None)
     page = _FakeChatPage()
@@ -523,6 +772,18 @@ def test_followup_registers_its_response_handler(monkeypatch):
     assert reading["handlers_inflight"] == 0, reading
     # `_FakeChatPage.goto` 先派 user/info、后派 friend/list ⇒ 最后进入的那次往返是 friend list
     assert reading["handler_last_frag"] == chat_mod.FRIEND_LIST_URL_FRAG, reading
+
+
+def test_followup_detach_removes_its_handler(monkeypatch):
+    """`detach=True` 给同页重复读用（#73 发送后回读）：出口必须注销自己挂的 handler，
+    否则同一页第 2、3 次 followup 会把 `handlers_live` 抬到 2、3，「偏高 1」的判读失效。"""
+    fx._reset_handler_forensics()
+    monkeypatch.setattr(chat_mod.time, "sleep", lambda *_: None)
+    page = _FakeChatPage()
+    report = chat_mod.ChatFirstPlatform().followup(page, applied=[], detach=True)
+    assert report["totalConversations"] == 1, "注销不影响采集结果"
+    assert page.handlers["response"] == []
+    assert fx.handler_forensics()["handlers_live"] == 0
 
 
 def test_build_report_counts():
@@ -1658,3 +1919,14 @@ def test_grab_detail_bad_probe_shape_does_not_become_zero_hits(monkeypatch):
     out = container["empty_outcome"]
     assert "hit_total" not in out and "hit_selectors" not in out
     assert "形态异常" in out["probe_error"] and out["dom_rounds"] == 4
+
+
+def test_read_state_negative_count_is_unknown_not_already_read():
+    """负数不并入已读：生产解析器 `_unread_count` 已把负数洗成 None，这条管的是**绕过解析器**
+    直接构造的记录（历史报告回放、别的 caller）——「不知道」读成「都看过」是本读数唯一的致命错误方向。"""
+    assert chat_mod.read_state({"unreadMsgCount": -1}) == "unknown"
+    report = chat_mod.build_report(
+        [{"status": "hr_replied", "appliedJob": None, "unreadMsgCount": -1}], generated_at="2026-10-20 00:00:00"
+    )
+    assert report["unlinkedRepliedRead"] == 0
+    assert report["unlinkedRepliedReadUnknown"] == 1

@@ -1,5 +1,7 @@
 # 运行时依赖（== 固定版本；升级由 renovate 提案，minimumReleaseAge=7 天延迟采纳）
-camoufox==0.5.5
+# `[geoip]` 不是可选项：所有浏览器启动面都传 geoip=True，缺 maxminddb 时 Camoufox 数秒内抛
+# NotInstalledGeoIPExtra（形态与出网超时不同，见 docs/agents/integration-smoke.md 依赖安装段）。
+camoufox[geoip]==0.5.5
 # 以下两个是 portfolio_survey.py 的直接依赖（deptry DEP003 修复后显式声明）
 lxml==6.1.2
 pdfplumber==0.11.10

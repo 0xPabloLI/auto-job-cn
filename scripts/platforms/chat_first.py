@@ -6,6 +6,7 @@ import re
 import time
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import quote
 
 from . import PlatformBase
 from _forensics import (  # noqa: E402  #56 取证 A：handler 往返计数的登记与往返前后的拍点（状态归 `_forensics`）
@@ -21,6 +22,7 @@ from _forensics import (  # noqa: E402  #56 取证 A：handler 往返计数的�
     handler_roundtrip_enter,
     handler_roundtrip_exit,
     listener_attached,
+    listener_detached,
 )
 
 LOGIN_DIALOG_SELECTOR = ".boss-login-dialog, .boss-login-dialog-mask"
@@ -51,7 +53,22 @@ def is_logged_out(page, login_dialog_selector=LOGIN_DIALOG_SELECTOR):
 JOB_SEARCH_URL = "https://www.zhipin.com/web/geek/job"
 JOB_DETAIL_URL = "https://www.zhipin.com/job_detail/{eid}.html"
 CHAT_URL = "https://www.zhipin.com/web/geek/chat"
-# 会话数据源（#30/#21 探测结论，内部调研笔记（未随本仓分发） §3）：
+
+
+def chat_url_for(user_id):
+    """聊天页深链（#73）：`/web/geek/chat?id=<招聘者 id>`。
+
+    `?id=` 收的是**招聘者**（会话对端）的 id，不是 encryptJobId：`live_apply._in_chat_form`
+    里 #4 峰云岗的实测形态就是 `/web/geek/chat?id=<招聘者用户 id>`。调用方传 wapi 条目的
+    `encryptUid`（缺失时退 `encryptBossId`）——这两种是 #73 采用的深链来源；数字 `uid` 不参与
+    判据（真机 2026-10-21：站内导航后 SPA 会把 query 规范化掉，落地 URL 连 `?id=` 都不留，
+    「打开的是谁」由 `reply_inbound` 读右侧会话头判）。
+    id 是站点给的串（可能含 `/`、`+`、`=`），必须整体 quote：裸拼会把 query 拆坏，落地成
+    另一个人的会话或空页，而那种失败在页面上看起来与「这条对话不存在」一模一样。"""
+    return f"{CHAT_URL}?id={quote(str(user_id), safe='')}"
+
+
+# 会话数据源（#30/#21 探测结论，内部调研笔记目录（未随本仓分发）boss-chat-card-shape.md §3）：
 # 聊天页加载即请求的 wapi——拦截响应拿结构化会话列表（含 encryptJobId/毫秒时间戳/fromId）
 FRIEND_LIST_URL_FRAG = "/wapi/zprelation/friend/getGeekFriendList.json"
 USER_INFO_URL_FRAG = "/wapi/zpuser/wap/getUserInfo.json"
@@ -678,6 +695,91 @@ def grab_detail(page, detail_data, beat_fn=None):
     return ""
 
 
+# --- #66 阶段 2 归属守卫：入站对话绑的那个岗，现在还是不是一个岗位页 ----------------
+# 判据形状不靠设想：`private/data/probe/inbound_coverage_v2_20261020-120316.json` 把当日 16 条
+# 入站逐条 dump 过 `document.title`，12 条是正常岗位页、4 条已经不是岗位页（1 条 404 文案 +
+# 3 条被 Boss 换成「是什么职位 / 是做什么的 / …岗位职责」这类问答/SEO 内容页）。
+JOB_DEAD_MARKERS = ("您访问的页面不存在",)
+# 内容页（问答/SEO）与 404 分开列：处置相同（都不回），但归因不同——读数是给人看的。
+JOB_CONTENT_PAGE_MARKERS = ("是什么职位", "是做什么的", "什么是", "前景待遇", "岗位职责")
+JOB_TITLE_SHELL_RE = r"工作内容|职位描述|招聘信息|_|-?\s*BOSS直聘"
+# 短到这个长度就认不出是个岗位名（实测残渣形如「上海」——那是标题自带下划线被去壳规则切残的副产物，
+# 见 test_clean_job_title_underscore_in_title_is_known_loss）。保守方向：unresolved ⇒ 不回、只呈报，
+# 因为「回给一个认不出的岗」不可撤回，而"少回一条"下一场还在池子里。
+JOB_TITLE_MIN_CHARS = 6
+IDENTITY_GOTO_TIMEOUT_MS = 45000  # 与探针同款（详情页比列表页重，30000 实测会误判成取不到）
+IDENTITY_POLL_SECONDS = 12
+IDENTITY_POLL_INTERVAL_MS = 400
+
+
+def clean_job_title(raw_title):
+    """详情页 `document.title` → 岗位名。真形是 `「岗位名」_品牌名招聘-BOSS直聘`。
+    只去壳（分隔符之后的品牌段、站名后缀、「」【】引号），**不动岗位名本身的字**——
+    「招聘」是标题的一部分，留着才能拿去搜/比对。"""
+    head = re.split(JOB_TITLE_SHELL_RE, (raw_title or "").strip())[0].strip()
+    return re.sub(r"[「」【】\[\]]", "", head).strip()
+
+
+def classify_job_identity(raw_title):
+    """`document.title` → `(jobTitle, state)`，state ∈ ok / dead / unresolved。
+
+    先判 dead 再判长度：404 文案「您访问的页面不存在」自身就有 8 个字，反过来先量长度
+    会把它错归成"标题太短认不出"，`skippedReasons` 里就丢了三条失效岗的归因。"""
+    title = clean_job_title(raw_title)
+    if any(m in title for m in JOB_DEAD_MARKERS) or any(m in title for m in JOB_CONTENT_PAGE_MARKERS):
+        return title, "dead"
+    if len(title) < JOB_TITLE_MIN_CHARS:
+        return title, "unresolved"
+    return title, "ok"
+
+
+def job_identity(page, eid, login_dialog_selector=LOGIN_DIALOG_SELECTOR):
+    """`encryptJobId` → 岗位身份（详情页 `document.title`），供回复前的归属守卫判「岗还在不在」。
+
+    为什么主源是 title：v2 探针走 `/wapi/zpgeek/job/detail.json` **全数落空**——那条端点是
+    分栏视图发的，直跳的 `/job_detail/{eid}.html` 不发它；v1 用 DOM 选择器则串读到页内推荐卡片
+    （品牌读成别家）。title 同时含岗位名与公司名，且今日 16 条逐条可读。
+
+    这里**不挂 XHR 监听器**：`capture_xhr` 的 handler 里那次 `resp.json()` → `Response.body()`
+    是无超时协议往返，#56 认定的头号楔死源就是它按岗累积；本函数只需要一个 title，不值得为备用
+    证据引入一个新的楔死面。
+
+    `state=login` 与 `dead` 必须分开（9-12 那次「15 岗全搜不到」的假读数就是掉登录被读成岗失效）：
+    登录问题洗成失效岗，会把整批入站判成不可回。调用方见 login 应整场停，不是跳过这一条。
+    跳转抛异常 ⇒ `state=unresolved` + `error` 串，不往外抛（#38 观测/取证层不新增失败面）。"""
+    out = {"encryptJobId": eid, "rawTitle": "", "jobTitle": "", "state": "unresolved", "url": ""}
+    try:
+        page.goto(JOB_DETAIL_URL.format(eid=eid), wait_until="domcontentloaded", timeout=IDENTITY_GOTO_TIMEOUT_MS)
+    except Exception as e:  # noqa: BLE001  # 网络/协议失败是一格读数，不是一枚打断整场的异常
+        out["error"] = f"{type(e).__name__}: {e}"[:160]
+        return out
+    raw = ""
+    started = time.time()
+    while not raw.strip() and time.time() - started < IDENTITY_POLL_SECONDS:
+        try:
+            raw = (page.title() or "").strip()
+        except Exception:  # noqa: BLE001  # 读 title 失败按空处理，交给下面的 unresolved 分支
+            raw = ""
+        if not raw.strip():
+            try:
+                page.wait_for_timeout(IDENTITY_POLL_INTERVAL_MS)
+            except Exception as e:  # noqa: BLE001  # tab 已关/协议断：等不动就等于拿不到身份，落 unresolved 只呈报，别把整场打断
+                out["error"] = f"poll: {type(e).__name__}: {e}"[:160]
+                return out
+    out["rawTitle"] = raw[:160]
+    try:
+        out["url"] = (page.url or "")[:200]
+    except Exception:  # noqa: BLE001  # url 只是取证字段，取不到不影响判决
+        pass
+    if is_logged_out(page, login_dialog_selector):
+        out["state"] = "login"
+        return out
+    title, state = classify_job_identity(raw)
+    out["jobTitle"] = title
+    out["state"] = state
+    return out
+
+
 def collect_new_jds(listing, collected, applied_ids):
     """列表页新岗位收集：排除已投递、本轮重复（含单列表内重复）与无 id 项。"""
     seen = {j.get("encryptJobId") for j in collected}
@@ -691,9 +793,24 @@ def collect_new_jds(listing, collected, applied_ids):
     return new
 
 
+def _unread_count(raw):
+    """wapi `unreadMsgCount` 归一化：非负整数照实取，**其余一律 None（读态未知），不取 0**。
+    0 与 None 的分别是这条读数的全部价值：0＝确实都读过了，None＝这一条的来源没给
+    （DOM 降级路径 / wapi 形态漂移 / 值不是数）。把未知压成 0，等于对外宣称
+    「入站那批我们全读过了」，而用户正是靠未读数决定下一步去读哪几条（#66 阶段 2，
+    用户 2026-10-20 硬约束：链路不得消耗未读标记，所以未读只能靠只读字段拿）。"""
+    if isinstance(raw, bool) or raw is None:
+        return None
+    if isinstance(raw, int):
+        return raw if raw >= 0 else None
+    if isinstance(raw, str) and raw.strip().isdigit():
+        return int(raw.strip())
+    return None
+
+
 def parse_friend_entries(entries, my_user_id=None, applied=None):
     """wapi getGeekFriendList 条目 → 结构化对话（#30 修复：字段来源从整卡 innerText 猜行
-    改为结构化直取；字段映射裁决见 内部调研笔记（未随本仓分发） §5）。
+    改为结构化直取；字段映射裁决见 内部调研笔记目录（未随本仓分发）boss-chat-card-shape.md §5）。
     - name/company 语义：company 沿用旧粘连串「姓名+品牌+抬头」（reply_annotations 匹配键不变），
       干净值另存 brandName/title；
     - status：lastMessageInfo.fromId == 我方 userId ⇒ awaiting（[已读] ≠ 回复，#30 裁决），
@@ -738,7 +855,14 @@ def parse_friend_entries(entries, my_user_id=None, applied=None):
                 is_read=bool(mine and lmi.get("status") == 2),
                 applied=applied,
                 eid=e.get("encryptJobId"),
+                unread=_unread_count(e.get("unreadMsgCount")),
                 source="wapi",
+                # #73：深链 id 的候选与回读对照点，原样透传（`lastTS=0` 也照原样，不当缺失）。
+                encrypt_uid=e.get("encryptUid"),
+                encrypt_boss_id=e.get("encryptBossId"),
+                boss_uid=e.get("uid"),
+                last_ts=ts,
+                last_from_id=from_id,
             )
         )
     return results
@@ -766,6 +890,7 @@ def parse_dom_cards(cards, applied=None):
                 is_read=bool(mine and c.get("status_read")),
                 applied=applied,
                 eid=None,
+                unread=None,  # DOM 卡片没有未读数（四样：时间/姓名/徽标/正文）⇒ 读态未知
                 source="dom",
             )
         )
@@ -785,7 +910,26 @@ def _match_applied(eid, company, applied):
     return hits[0] if len(hits) == 1 else None
 
 
-def _conv_record(name, company, brand, title, last_msg, time_iso, last_time, status, is_read, applied, eid, source):
+def _conv_record(
+    name,
+    company,
+    brand,
+    title,
+    last_msg,
+    time_iso,
+    last_time,
+    status,
+    is_read,
+    applied,
+    eid,
+    source,
+    unread=None,
+    encrypt_uid=None,
+    encrypt_boss_id=None,
+    boss_uid=None,
+    last_ts=None,
+    last_from_id=None,
+):
     matched = _match_applied(eid, company, applied)
     return {
         "name": name,
@@ -798,14 +942,65 @@ def _conv_record(name, company, brand, title, last_msg, time_iso, last_time, sta
         "lastTime": last_time,
         "status": status,
         "is_read": is_read,
+        # 未读条数（#66 阶段 2）。注意与 `is_read` 不是一回事、也不可互相代替：`is_read` 说的是
+        # **我方发出去的那条被对方读了没**（lastMessageInfo.status==2），`unreadMsgCount` 说的是
+        # **对方发我们的还有几条没读**。后者本来想用来分「还没读 / 读了没回」，但 10-21 实测它分不出来（见 `read_state`）。
+        "unreadMsgCount": unread,
         "appliedJob": matched.get("jobName") if matched else None,
         "encryptJobId": eid or (matched or {}).get("encryptJobId"),
         "source": source,
+        # #73 深链与发送回读的地址/对照字段：wapi 条目原样透传，DOM 降级路径一律 None
+        # （卡片只有时间/姓名/徽标/正文四样，没有这些）。
+        "encryptUid": encrypt_uid,
+        "encryptBossId": encrypt_boss_id,
+        "bossUid": boss_uid,
+        "lastTS": last_ts,
+        "lastFromId": last_from_id,
     }
 
 
-def build_report(results, generated_at):
-    """结构化对话 → 统计报告。"""
+def inbound_waiting(convs):
+    """入站、且球在我们这侧的那批对话（#66 阶段 2 的动作面对象）。
+
+    判据两条：末条是对方发言（`status == hr_replied`）+ 归不到我们的投递记录
+    （`appliedJob` 空）。这是单一实现处——`followup_tracker` 的 `[入站线索]` 清单和
+    `reply_inbound` 的候选都走它；各写一遍迟早漂，漂了以后呈报的数与回复面的数对不上。"""
+    return [c for c in convs if c.get("status") == "hr_replied" and not c.get("appliedJob")]
+
+
+# 读态的中文标签（呈报侧唯一一份）：`followup_tracker` 的 `[入站线索]` 清单与
+# `reply_inbound` 的候选清单都从这里取——判据是 `read_state`，措辞也必须同源，
+# 否则两处改词会让同一个人在两份读数里看到不同的名字。
+STATE_LABELS = {"unread": "有未读", "read": "无未读标记", "unknown": "读态未知"}
+
+
+def read_state(rec):
+    """一条对话的读态 → `unread` / `read` / `unknown`（#66 阶段 2，判据唯一实现处）。
+
+    未知**不并入已读**：历史报告回放、DOM 降级路径、wapi 少给这个键，都只能报未知。
+    把它读成「都看过了」等于对用户谎报，而那正是用户要靠这列判断的事。
+
+    **但这条判据在真机上是空的（2026-10-21 两场测量）**：09:05 与 09:54 两次快照里 68/68 条
+    `unreadMsgCount` 全为 0，而 09:54 那一次用户确认 Boss 上**有未读会话**、且两次之间 hr_replied
+    还从 18 涨到 20（新消息确实在进来）。⇒ geek 侧这个字段不携带未读态。所以 `read` 这一格只能
+    读成「站点没给未读标记」，**不能**读成「我们看过没回」；标签因此改名成「无未读标记」。
+    「该去读哪几条」这个问题这列答不了——只有 Boss 自己的未读徽标答得了，而那要人去看。
+    `bool` 不是计数（`True` 会满足 `> 0`），显式排除。展示侧（followup_tracker 的
+    `[入站线索]` 清单）与本文件的分桶计数都走这里，不各写一份。"""
+    u = rec.get("unreadMsgCount")
+    if isinstance(u, bool) or not isinstance(u, int):
+        return "unknown"
+    if u > 0:
+        return "unread"
+    # 0 才算已读；负数（生产路径到不了——`_unread_count` 已洗成 None，但历史报告回放与别的
+    # caller 可能直接构造）不并入已读，否则又回到「把不知道读成都看过」那个错误方向。
+    return "read" if u == 0 else "unknown"
+
+
+def build_report(results, generated_at, my_user_id=None):
+    """结构化对话 → 统计报告。`myUserId` 恒在（#73）：发送后的 wapi 回读要判「末条 fromId
+    是不是我方」，而 userId 只有采集那一刻从 `getUserInfo` 响应里拿得到，不跟着报告出来，
+    回读侧就只能靠猜或再发一次请求。采集时没拿到就是 None（回读侧据此 fail-closed）。"""
     replied = [r for r in results if r["status"] == "hr_replied"]
     awaiting = [r for r in results if r["status"] == "awaiting"]
     total = len(results)
@@ -817,9 +1012,13 @@ def build_report(results, generated_at):
     # eval 的配对从招呼语台账侧驱动，台账里没有的岗根本进不了 records
     # （实测 81 条对话 16 条未关联，15 条已回复里 13 条出自这批）。两键恒在（0 也写出来）。
     unlinked = [r for r in results if not r["appliedJob"]]
-    unlinked_replied = [r for r in unlinked if r["status"] == "hr_replied"]
+    unlinked_replied = inbound_waiting(results)
+    # 等回话那批再按读态分三桶（恒在）。三桶相加＝unlinkedReplied，由 test_platforms 钉住——
+    # 分母不等于该桶的读数会被读成「漏了几条」。
+    waiting_states = [read_state(r) for r in unlinked_replied]
     return {
         "generatedAt": generated_at,
+        "myUserId": my_user_id,
         "totalConversations": total,
         "hrReplied": len(replied),
         "awaiting": len(awaiting),
@@ -828,6 +1027,10 @@ def build_report(results, generated_at):
         "linkedReplied": len(linked_replied),
         "unlinkedConversations": len(unlinked),
         "unlinkedReplied": len(unlinked_replied),
+        "unreadConversations": sum(1 for r in results if read_state(r) == "unread"),
+        "unlinkedRepliedUnread": waiting_states.count("unread"),
+        "unlinkedRepliedRead": waiting_states.count("read"),
+        "unlinkedRepliedReadUnknown": waiting_states.count("unknown"),
         "conversations": results,
     }
 
@@ -875,15 +1078,20 @@ class ChatFirstPlatform(PlatformBase):
         （进详情→人读→沟通→起草→gate→键入发送）。"""
         raise NotImplementedError("apply 随挂机盲投链路清理（#44）；投递由 live_apply 承担")
 
-    def followup(self, page, applied, beat_fn=None):
+    def followup(self, page, applied, beat_fn=None, detach=False):
         """打开消息页拿会话列表（#30 修复）：wapi 拦截为主链路（getGeekFriendList 结构化
         全量，带 encryptJobId 与毫秒时间戳），结构化 DOM 降级；字段映射见
-        内部调研笔记（未随本仓分发）。探测结论：聊天实时流走 WS
+        内部调研笔记目录（未随本仓分发）boss-chat-card-shape.md。探测结论：聊天实时流走 WS
         （wss://ws6.zhipin.com/chatws），page.on("response") 抓不到，但不逆向——
         会话列表数据 wapi 已完整覆盖。
         #59 修复轮 R4-1：beat_fn 形参（#56 A3 同形态，`grab_detail` / `find_comm_button` 一致）——
         平台层不知道心跳为何物，由调用方注入并自行吞异常，默认 None = 零行为变更。本段的
-        「goto 上界 + 固定停顿」是会话内最长的合法静默区间之一，拍点让它落在取栈阈值之下。"""
+        「goto 上界 + 固定停顿」是会话内最长的合法静默区间之一，拍点让它落在取栈阈值之下。
+        `detach=True` 给**会话中途的重复读**用（#73 发送后回读）：默认路径停在会话末尾的聊天页、
+        页面随后整体关闭，留一个 handler 不影响判读；但同一页面上重复调用会把 `handlers_live`
+        抬高成 2、3…，那时「偏高 1」的既有判读就不成立了。所以正常出口（含登录过期早退）都注销
+        自己挂的那个；中途异常时保持挂着（诚实读数），由会话收尾关闭页面。注销失败时计数同样
+        保持挂着并打警告——重复读的代价只是多一个解析器。"""
         beat = beat_fn or _no_beat
         captured = {"friends": None, "uid": None}
 
@@ -903,10 +1111,21 @@ class ChatFirstPlatform(PlatformBase):
 
         # 监听必须在 goto 前注册：friend list 由页面加载即请求
         page.on("response", h)
-        # #56 取证 A：登记 handler（`on` 成功后才登记）。本 handler **没有**注销点——`followup`
-        # 走的是会话末尾的聊天页，页面随后整体关闭，所以这一项会一直留在 `handlers_live` 里。
-        # 判读时记得：收尾采集之后的读数天然偏高 1，它不是泄漏（A1 管的是投递期逐岗累积）。
+        # #56 取证 A：登记 handler（`on` 成功后才登记）。默认路径停在会话末尾的聊天页、页面
+        # 随后整体关闭，所以这一项会一直留在 `handlers_live` 里——收尾采集之后的读数天然偏高 1，
+        # 它不是泄漏（A1 管的是投递期逐岗累积）。`detach=True` 的重复读则必须在出口注销自己。
         listener_attached(h)
+
+        def _detach():
+            if not detach:
+                return
+            try:
+                page.remove_listener("response", h)
+            except Exception as e:  # noqa: BLE001  # 注销失败保持计数挂着，是诚实读数
+                print(f"[warn] followup 监听器注销失败（{type(e).__name__}: {str(e)[:60]}）——handlers_live 保持挂着")
+            else:
+                listener_detached(h)
+
         beat("followup:goto-chat:pre")
         page.goto(CHAT_URL, wait_until="domcontentloaded", timeout=CHAT_GOTO_TIMEOUT_MS)
         beat("followup:goto-chat:post")
@@ -914,6 +1133,7 @@ class ChatFirstPlatform(PlatformBase):
 
         if is_logged_out(page, self.login_dialog_selector):
             print("[停] 登录态过期")
+            _detach()
             return None
 
         # wapi 响应可能晚于 goto 返回：把这段轮询窗口扫满（FRIEND_POLL_ROUNDS ×
@@ -925,7 +1145,7 @@ class ChatFirstPlatform(PlatformBase):
         # 返回 3，比旧实现更差。扫满窗口取最大值不新增任何可调阈值，读数不再取决于「哪一次
         # 响应被当成终点」。
         # **「取最大批＝拿全」是假定，不是实测结论**：实测到的形态是站点**一次调用返回全量**
-        # （内部调研笔记（未随本仓分发） §3「一次调用返回全部 61 条，观测窗口内滚动未触发
+        # （内部调研笔记目录（未随本仓分发）boss-chat-card-shape.md §3「一次调用返回全部 61 条，观测窗口内滚动未触发
         # 分页调用」），于是各批之间互为**超集**，最大批即全量。风险留在这里：若站点改成
         # **增量分页**（每批是不同页、互不包含），取最大批会**静默丢批**——那时正确的出口是按
         # encryptJobId 取**并集**。本函数与 `test_platforms.py` 的桩序列（3 → 50 → 50、100 → 3）
@@ -962,4 +1182,5 @@ class ChatFirstPlatform(PlatformBase):
             cards = page.evaluate(CONVS_JS)
             print(f"[对话列表] {len(cards)} 个")
             results = parse_dom_cards(cards, applied)
-        return build_report(results, generated_at=time.strftime("%Y-%m-%d %H:%M:%S"))
+        _detach()
+        return build_report(results, generated_at=time.strftime("%Y-%m-%d %H:%M:%S"), my_user_id=captured["uid"])

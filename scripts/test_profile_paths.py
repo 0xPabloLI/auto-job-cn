@@ -126,9 +126,9 @@ def test_browser_profile_dir_incumbent_keeps_name(tmp_path):
 
 
 def test_resume_path_relative_and_absolute(tmp_path):
-    r = _registry(tmp_path, default="web3", profiles={"web3": {"resume": "private/sample_resume.pdf"}})
+    r = _registry(tmp_path, default="web3", profiles={"web3": {"resume": "private/Resume_示例用户.pdf"}})
     p = pp.resume_path("web3", root=r)
-    assert p == r / "private" / "sample_resume.pdf"
+    assert p == r / "private" / "Resume_示例用户.pdf"
     r2 = _registry(tmp_path, profiles={"ai": {"resume": "/abs/path/resume.md"}})
     assert pp.resume_path("ai", root=r2) == Path("/abs/path/resume.md")
 

@@ -9,7 +9,7 @@
   （每行一个 URL 或本地路径，# 开头为注释，空行忽略；文件不存在时报错退出）。
   --sources 优先于 --sources-file。
 
-输入（v1 范围，技术路径依据 内部调研笔记（未随本仓分发））：
+输入（v1 范围，技术路径依据 内部调研笔记目录（未随本仓分发）portfolio-survey-research.md）：
   - http(s) URL：静态抓取（urllib+lxml，剔除 script/style）→ 正文 < 500 字符判
     「疑似 JS 渲染」自动走 Camoufox headless 渲染降级（lazy import）→ 仍过薄显式报错
   - 本地 .pdf：pdfplumber 文本层提取（lazy import）；无文本层（疑似扫描件）显式报错，

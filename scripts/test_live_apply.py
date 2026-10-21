@@ -43,6 +43,9 @@ import _forensics as fx  # noqa: E402
 # 生产端改了 URL 而锚没跟上就当场红，而不是等真机跑一场才发现守卫恒不命中。
 from platforms import chat_first as chat_mod  # noqa: E402
 
+# #75 条目 B：收尾采集这条路径也要落水位线两键——用例按真实写入口造「上次基准」，不手搓形态。
+import _inbound_watermark as wm  # noqa: E402
+
 # 最直接的自证：别名函数的 `__globals__` 必须就是 `fx` 的命名空间——patch 打在 `fx` 上，写者才读得到。
 # 将来若有人改用 spec-from-file 另加载一份 `_forensics`，这里当场红，而不是留一堆静默 no-op 的隔离。
 assert mod._touch_heartbeat.__globals__ is fx.__dict__, "取证模块必须是同一个对象"
@@ -136,7 +139,7 @@ def test_request_greeting_writes_job_context(tmp_path):
         "brandName": "某Web3公司",
         "salaryDesc": "30-50K",
         "encryptJobId": "abc",
-        "bossName": "岑先生",
+        "bossName": "汝先生",
         "bossTitle": "CTO",
     }
     path = mod.request_greeting(tmp_path, 3, job, "JD 全文：负责合约开发")
@@ -144,7 +147,7 @@ def test_request_greeting_writes_job_context(tmp_path):
     assert path.name == "request_3.json"
     assert data["jobName"] == "智能合约工程师" and data["brandName"] == "某Web3公司"
     assert data["salaryDesc"] == "30-50K" and data["jdText"].startswith("JD 全文")
-    assert data["bossName"] == "岑先生"
+    assert data["bossName"] == "汝先生"
 
 
 def test_wait_reply_picks_up_reply(tmp_path):
@@ -830,9 +833,9 @@ def test_salutation_no_name_uses_ninhao():
 
 
 def test_salutation_honorific_kept_as_is():
-    assert mod.salutation_warnings("薛女士", "HR", "薛女士您好，我有7年经验。") == []
-    warns = mod.salutation_warnings("薛女士", "HR", "您好，我有7年经验。")
-    assert any("薛女士" in w for w in warns), warns
+    assert mod.salutation_warnings("汶女士", "HR", "汶女士您好，我有7年经验。") == []
+    warns = mod.salutation_warnings("汶女士", "HR", "您好，我有7年经验。")
+    assert any("汶女士" in w for w in warns), warns
     # 平台装饰前缀：A商务-李经理 → 用「李经理」即算原样保留
     assert mod.salutation_warnings("A商务-李经理", "HR", "李经理您好，我有7年经验。") == []
 
@@ -1363,13 +1366,28 @@ _LIST_URL = "https://www.zhipin.com/web/geek/job?query=Solidity&city=101020100"
 _DETAIL_URL = "https://www.zhipin.com/job_detail/e1.html?lid=abc"
 
 
+class _FakeKeyboard:
+    """键盘替身：记下 press 过的键名（#68）。
+    为什么要新增这个类——本文件此前**任何**替身页都没有 `keyboard`，因为 Enter 兜底那一支
+    在生产里恒不触发（判据查字符串 `"contenteditable" in "DIV|true"` 永假），也就从没人真调过
+    `page.keyboard.press`。替身缺这块，正是那条分支被测试永久绕过的物证。"""
+
+    def __init__(self):
+        self.pressed = []
+
+    def press(self, key):
+        self.pressed.append(key)
+
+
 class _SendPage:
     """发送段替身：url 可配（详情判定锚点）；query_selector 恒 None（登录框不命中）；
-    panel_title 可配（#33 第八轮：分栏视图判据走 evaluate 取右栏标题，默认空 = 非分栏）。"""
+    panel_title 可配（#33 第八轮：分栏视图判据走 evaluate 取右栏标题，默认空 = 非分栏）。
+    `keyboard` 记录 Enter 兜底那一下（#68 新用例的取证点）。"""
 
     def __init__(self, url, panel_title=""):
         self.url = url
         self.panel_title = panel_title
+        self.keyboard = _FakeKeyboard()
 
     def evaluate(self, js, *args):
         return self.panel_title
@@ -1385,7 +1403,10 @@ class _SendPage:
 
 
 class _FakeInputEl:
-    """输入框替身：evaluate 报 TEXTAREA（非 contenteditable），fill 记录内容。
+    """输入框替身：代表真实聊天弹窗那个 `textarea`（**非** contenteditable），fill 记录内容。
+    #68：`evaluate` 按脚本**分派**应答——问 `isContentEditable` 回 False（它今天回字符串
+    `"TEXTAREA|"`，被 `bool()` 一取就成了真值，那正是本票要的负对照「靠巧合绿」）；
+    问老的 tagName 探针仍回 `"TEXTAREA|"`，两条各自诚实。
     #62 补的一条应答：反馈浮层祖先链探针回 0（＝不在浮层里）。本替身代表的是**真实聊天弹窗**
     那个 `textarea`，它按定义就不在 `.c-satisfaction-feedback` 容器内——补这条是把替身本来就
     声称代表的 DOM 形态交代给新探针，不是放宽被测行为（对照 `_FeedbackBoxEl`：同一个探针它回 1，
@@ -1397,6 +1418,8 @@ class _FakeInputEl:
     def evaluate(self, js, *args):
         if "AUTOJOB_FEEDBACK_PROBE" in js:
             return 0
+        if "isContentEditable" in js:
+            return False
         return "TEXTAREA|"
 
     def click(self, **kw):
@@ -2826,7 +2849,54 @@ def test_init_live_session_wires_collect_cfg(monkeypatch, tmp_path):
     assert run.session.cfg["live_recommend"] is True, "开关不落 cfg → 推荐来源恒不开（本次修掉的 bug）"
     assert run.session.cfg["collect_cap"] == mod.COLLECT_CAP_DEFAULT
     assert run.session.cfg["recommend_cap"] == mod.RECOMMEND_CAP_DEFAULT, "#65 配额不落 cfg → 生产恒不截断"
+    assert run.session.cfg["reply_timeout"] == mod.REPLY_TIMEOUT_DEFAULT, (
+        "起草窗口不落 cfg → 消费点回落到另一份数（两处默认值漂开的老毛病）"
+    )
     assert "采集上限" in shown["recommend_desc"], "横幅口径与 cfg 同源"
+
+
+def test_reply_timeout_default_has_one_source(monkeypatch, tmp_path):
+    """起草窗口（2026-10-20 由 1200 收到 420）：默认值只许活在常量一处。
+
+    修掉的老毛病：解析处写 1200、消费处 `cfg.get("reply_timeout", 600)` 又写一份 600——
+    改默认时漏掉后者，生产按前者的数、一旦 cfg 少落键就静默换成另一个数。"""
+    for name, fn in [
+        ("resolve_active_profile", lambda env=None: ("blockchain", "")),
+        ("profile_line", lambda name, prefix: "[profile] blockchain"),
+        (
+            "load_config",
+            lambda env=None: {"quiet_hours": (0, 0), "daily_limit_fixed": True, "daily_limit": 20, "cap_jitter": 0},
+        ),
+        ("effective_daily_limit", lambda cfg, state_path=None: 20),
+        ("profile_sections", lambda path: None),
+        ("parse_queries", lambda env: ["AI"]),
+        ("is_quiet_hour", lambda hour, quiet: False),
+        ("startup_jitter", lambda cfg: None),
+        ("SessionPacer", lambda cfg, **kw: SimpleNamespace()),
+        ("get_platform", lambda: SimpleNamespace()),
+        ("load_applied_ids", lambda path: set()),
+        ("load_excluded_companies", lambda path: set()),
+        ("_open_session_dirs", lambda base, vbase, record, ts: (tmp_path / "s", tmp_path / "shots", {})),
+        (
+            "session_banner",
+            lambda queries, limit, limit_desc, applied_ids, excluded, session_dir, dry_run, recommend_desc="": None,
+        ),
+    ]:
+        monkeypatch.setattr(mod, name, fn)
+    monkeypatch.setattr(
+        mod,
+        "private_path",
+        lambda rel, prefix="": tmp_path / "private" / Path(rel).parent / f"{prefix}{Path(rel).name}",
+    )
+
+    assert mod._init_live_session({"LIVE_REPLY_TIMEOUT": "120"}).session.cfg["reply_timeout"] == 120
+    assert (
+        mod._init_live_session({"LIVE_REPLY_TIMEOUT": ""}).session.cfg["reply_timeout"] == mod.REPLY_TIMEOUT_DEFAULT
+    ), "空串必须回落到常量而不是 0（0 = 立刻超时，等于把每个岗判死）"
+
+    src = Path(mod.__file__).resolve().read_text(encoding="utf-8")
+    assert 'cfg.get("reply_timeout", REPLY_TIMEOUT_DEFAULT)' in src, "消费点还带着第二份字面量默认值"
+    assert 'env.get("LIVE_REPLY_TIMEOUT", str(REPLY_TIMEOUT_DEFAULT))' in src, "解析点不引用常量"
 
 
 def test_init_live_session_recommend_cap_wires_env_to_truncation(monkeypatch, tmp_path, capsys):
@@ -3344,7 +3414,7 @@ def test_request_greeting_without_recruiter_active_omits_fields(tmp_path):
 
 
 def test_record_greeting_carries_recruiter_active(tmp_path):
-    job = {"encryptJobId": "eid1", "jobName": "岗", "brandName": "司", "bossName": "岑先生", "bossTitle": "CTO"}
+    job = {"encryptJobId": "eid1", "jobName": "岗", "brandName": "司", "bossName": "汝先生", "bossTitle": "CTO"}
     path = tmp_path / "greetings.json"
     assert (
         mod.record_greeting(
@@ -3394,6 +3464,39 @@ def test_collect_fresh_followup_writes_latest_report(tmp_path, capsys, monkeypat
     assert json.loads(out.read_text(encoding="utf-8")) == report
     assert run.session.state["followup_fresh"] is True
     assert "现场采集 2 条对话（HR 回复 1）" in capsys.readouterr().out
+
+
+def test_collect_fresh_followup_report_carries_watermark_readings(tmp_path, monkeypatch):
+    """#75 review 条目 B：`newSinceWatermark` / `watermark` 原来只在 `followup_tracker.run()` 注入，
+    而这条路径**整份重写同一个 followup_report.json** 且不带那两键——投递场次收尾正是用户读这份
+    报告的时刻（runbook 的「先看哪几条」在那里拿）。两键必须由同一个函数落，两个消费者才不会一个有一个没有。
+    同时钉住：这条路径**只读**，一个字都不写基准。"""
+    run = _fresh_run(tmp_path, applied=[{"encryptJobId": "e1"}])
+    convs = [
+        {"encryptJobId": "e1", "status": "hr_replied", "lastTS": 1792000000000},
+        {"encryptJobId": "e2", "status": "hr_replied", "lastTS": 1792999999000},
+    ]
+    report = {"totalConversations": 2, "myUserId": 780045835, "conversations": convs}
+    monkeypatch.setattr(run.session.platform, "followup", lambda page, applied, **kw: report, raising=False)
+    out = tmp_path / "followup_report.json"
+    monkeypatch.setattr(mod.g, "resolve_paths", lambda env=None: {"followup": out})
+    monkeypatch.setattr(mod, "resolve_active_profile", lambda **k: ("default", ""))
+    monkeypatch.setattr(
+        mod, "private_path", lambda relative, prefix="": tmp_path / "private" / f"{prefix}{Path(relative).name}"
+    )
+    base_path = tmp_path / "private" / "inbound_watermark.json"
+    mod._collect_fresh_followup(run, page=None)
+    data = json.loads(out.read_text(encoding="utf-8"))
+    assert data["newSinceWatermark"] is None and data["watermark"]["state"] == "first_run", data
+    assert not base_path.exists(), "收尾采集只报不写——推进是 --mark-read 的事"
+    # 已有基准时同一场读数念得出差值（判据与 followup_tracker 完全同源）
+    wm.advance_watermark(
+        base_path, [convs[0]], wm.empty_base("default"), profile="default", snapshot_at="2026-10-19 09:00:00"
+    )
+    mod._collect_fresh_followup(run, page=None)
+    again = json.loads(out.read_text(encoding="utf-8"))
+    assert again["newSinceWatermark"] == 1 and again["watermark"]["state"] == "ok", again
+    assert again["watermark"]["snapshotAt"] == "2026-10-19 09:00:00"
 
 
 def test_collect_fresh_followup_failure_swallowed(tmp_path, capsys, monkeypatch):
@@ -5074,7 +5177,7 @@ def test_scroll_collect_touches_heartbeat_each_round(tmp_path, monkeypatch):
 
 
 def test_wait_reply_touches_heartbeat_while_polling(tmp_path, monkeypatch):
-    """agent 起草等待是合法长停（默认 1200s）——轮询必须逐拍心跳，否则起草期必被误杀。"""
+    """agent 起草等待是合法长停（窗口见 `REPLY_TIMEOUT_DEFAULT`）——轮询必须逐拍心跳，否则起草期必被误杀。"""
     monkeypatch.setattr(fx, "_HEARTBEAT_DIR", tmp_path)
     (tmp_path / "reply_9.json").write_text(json.dumps({"send_text": "你好"}), encoding="utf-8")
     mod.wait_reply(tmp_path, 9, timeout=10, poll=0, sleep_fn=lambda s: None, now_fn=lambda: 0.0, grace=0)
@@ -6182,7 +6285,7 @@ def test_net_probe_points_at_the_detail_shape_of_the_stalled_job():
     "body,why",
     [
         (
-            b"<title>\xe5\xae\x89\xe5\x85\xa8\xe9\xaa\x8c\xe8\xaf\x81</title>",
+            b"<title>\xe5\xae\x89\xe5\x85\xa8\xe9\xaa\x8c\xe8\xaf\x81 - BOSS</title>",
             "安全验证页（2026-10-11 实测四条详情页全落这张）",
         ),
         (
@@ -9428,11 +9531,15 @@ _CHAT_URL = "https://www.zhipin.com/web/geek/chat?id=b7f2c1a0"
 class _GreetEl:
     """招呼语输入框替身：把三类「打字动作」都计数——守卫的验收口径是「确定一个字都没打进页面」，
     只盯 `fill` 会漏掉逐字键入分支（`_type_greeting` 按 paste_prob 随机二选一）和聚焦点击。
-    `evaluate` 的应答与既有 `_FakeInputEl` 同形（报 TEXTAREA = 非 contenteditable），
-    另外能回答 #62 的反馈浮层祖先链探测（0 = 不在浮层内）。"""
+    `evaluate` 的应答与既有 `_FakeInputEl` 同形，另外能回答 #62 的反馈浮层祖先链探测（0 = 不在浮层内）。
+    #68：按**脚本**分派——`editable=True` 建模 `<div contenteditable="true">`（问 `isContentEditable`
+    回 True、问老的 tagName 探针回 `"DIV|true"`），默认 False 建模沟通输入框那个 `textarea`。
+    分派是本票的要点：负对照（textarea + 无发送按钮 ⇒ `send_btn_missing`）必须由「替身对
+    isContentEditable 那问老实回 False」撑起，不能再靠 `bool("TEXTAREA|")` 这种字符串巧合。"""
 
-    def __init__(self, tag="TEXTAREA|"):
+    def __init__(self, tag="TEXTAREA|", editable=False):
         self.tag = tag
+        self.editable = editable
         self.fills = []
         self.clicks = 0
         self.overlay_probes = 0
@@ -9444,6 +9551,12 @@ class _GreetEl:
         if "AUTOJOB_FEEDBACK_PROBE" in js:
             self.overlay_probes += 1
             return 0
+        return self._answer(js)
+
+    def _answer(self, js):
+        """非浮层探针的其余脚本按形态如实作答（子类只需改探针那一条）。"""
+        if "isContentEditable" in js:
+            return self.editable
         return self.tag
 
     def click(self, **kw):
@@ -9463,7 +9576,7 @@ class _FeedbackBoxEl(_GreetEl):
         if "AUTOJOB_FEEDBACK_PROBE" in js:
             self.overlay_probes += 1
             return 1
-        return self.tag
+        return self._answer(js)
 
 
 def _run_guard_case(
@@ -9740,6 +9853,9 @@ def test_post_typing_no_send_stays_out_of_the_retry_ledger(tmp_path, monkeypatch
     ]:
         page = _SendPage(_CHAT_URL)  # 形态合法 ⇒ 守卫放行，一路走到打字与发送
         el = _GreetEl()
+        # 本条负对照**成立的理由**要钉死：替身代表 textarea ⇒ 问 `isContentEditable` 老实回 False。
+        # 若只靠 `bool("TEXTAREA|")` 这类字符串巧合撑起，判据一换（#68）这条就会以错的姿态绿。
+        assert el.evaluate("el => !!el.isContentEditable") is False, f"{reason} 的前提：它不是 contenteditable"
         _, results, state, calls, typed = _run_guard_case(tmp_path, monkeypatch, page, el, **kwargs)
         assert [r["status"] for r in results] == ["no_send"], reason
         assert results[0].get("reason") == reason, "两种成因要能分辨（读数按它分桶）"
@@ -9747,6 +9863,25 @@ def test_post_typing_no_send_stays_out_of_the_retry_ledger(tmp_path, monkeypatch
         assert not state.get("retry_pending"), f"{reason} 不进补投台账（双发风险）"
         assert "retry_touched" not in state, f"{reason} 不该动台账落盘开关"
         assert calls["evidence"] == ["live-no-send-1"], "存证仍用发送段旧标签，别和 off_chat 混"
+
+
+def test_contenteditable_chat_input_falls_back_to_enter_not_no_send(tmp_path, monkeypatch):
+    """#68 那条恒不触发分支的**第一条**用例证据：聊天页输入框是 `<div contenteditable="true">`
+    且找不到独立发送按钮 ⇒ 走 Enter 把招呼发出去，**不记** `no_send` / `send_btn_missing`。
+    修之前判据是 `"contenteditable" in (el.tagName + '|' + 属性值)`——`<div contenteditable="true">`
+    实得 `"DIV|true"`，串里永不含那个词 ⇒ `elif is_contenteditable:` 永远不进，直接落 else。
+    本票的诞生原因正是「分支被测试永久绕过而全绿」，所以这条用例是这支代码在本仓第一次被执行；
+    负对照见上一条（textarea ⇒ 照旧落 `send_btn_missing`，#62 口径不动）。"""
+    page = _SendPage(_CHAT_URL)
+    el = _GreetEl(tag="DIV|true", editable=True)  # 真机聊天页形态：contenteditable 容器，无独立按钮
+    outcome, results, state, calls, _typed = _run_guard_case(tmp_path, monkeypatch, page, el, send_btn="NONE")
+    assert page.keyboard.pressed == ["Enter"], "Enter 兜底必须真的按下——本票修的就是这一支恒不触发"
+    assert [r["status"] for r in results] == ["applied"], f"聊天页不该记 no_send：{results}"
+    assert len(el.fills) == 1, "先打字再 Enter（Enter 是发送动作，不是输入动作）"
+    assert state["applied"] == 1, "Enter 发出后照常计成品"
+    assert not state.get("retry_pending"), "已发出的岗不进补投台账"
+    assert calls["evidence"] == [], "走通兜底就不该再存 no-send 现场存证"
+    assert outcome == "next"
 
 
 def test_no_send_reason_stats_keeps_four_keys_and_buckets_by_cause():

@@ -76,6 +76,7 @@ from _profile_paths import (  # noqa: E402  #28：私有路径唯一出口（废
 )
 from _atomic_io import write_json_atomic
 import _edd  # #37 EDD 趋势观测：会话收尾快照的渲染层
+import _inbound_watermark as wm  # noqa: E402  #75 条目 B：收尾采集的报告也带水位线两键（只读、不推进）
 import _issue_reporter  # #51 熔断/停批事件建票（HITL 提示 + AUTOJOB_AUTO_ISSUE=1 自动）
 import _logging  # #38 机读日志旁路：print 人读层不动，事件旁路落 JSONL（双轨制）
 import _forensics  # noqa: E402  #57 第二轮：心跳/取栈取证本体（#56 A 段）拆出 _forensics.py，纯搬迁行为不变
@@ -185,12 +186,17 @@ SESSION_BASE = ROOT / "private/data/live_session"  # legacy 默认；run_live �
 VIDEO_BASE = ROOT / "private/data/videos"
 CLOSE_SENTINEL = "CLOSE"
 SKIP = "__SKIP__"  # reply_N.json 写 {"skip": true} → agent 判定岗位不匹配，立即跳过不投
+# 起草窗口默认值（2026-10-20 由 1200 收到 420）：502 对可用 request/reply mtime 里 p90 174s、
+# p95 258s，>600s 仅 7 条且全是「没人盯队列」而不是起草慢——1200 档下这种场次每岗烧 20 分钟才
+# 暴露。旧档 1200 的理由是 2026-09-25「事后补 reply 无效」，那条已被 #55 的宽限复查修掉，
+# 故有效窗口是 420+GRACE_REPLY_WINDOW；超时岗不落虚空，走 #55 分流（会话内补投→跨会话台账）。
+REPLY_TIMEOUT_DEFAULT = 420  # 每岗等 agent 草稿的窗口（LIVE_REPLY_TIMEOUT 的默认值）
 GRACE_REPLY_WINDOW = 90  # #55：agent 起草超时后的宽限复查窗口秒数（票面 60-120s 取中）
 GRACE_REPLY_POLL = 5  # #55：宽限期内复查 reply 文件的间隔秒数
 RETRY_ATTEMPTS_CAP = 3  # #55：断点台账 attempts 累计封顶——对永久问题岗位不无限重试
 
 # 岗位来源（#33）：搜索与推荐两处来源**共用同一个页面** = 顶栏「职位」`/web/geek/jobs`
-# （形态实测见 内部调研笔记（未随本仓分发） §10）。两个模式只差有没有 query：
+# （形态实测见 内部调研笔记目录（未随本仓分发）boss-recommend-card-shape.md §10）。两个模式只差有没有 query：
 #   无 query → GET  /wapi/zpgeek/pc/recommend/job/list.json?page=N&pageSize=15   （推荐列表）
 #   带 query → POST /wapi/zpgeek/search/joblist.json                              （搜索结果）
 #   注意搜索那个端点的**页码在 POST body 里**，URL 只剩 ?_=<ts>——只看 URL 会误判「没有分页」。
@@ -1473,7 +1479,7 @@ def recommend_list(page, limit=None, target=0, flags=None):
     goto_with_retry，异常向上抛由推荐流轮级边界记账；首条命中后再等一窗口，因为页面
     初始化会并发拉请求，覆盖式收集只留最后一条会丢先到的整批。
 
-    形态（实测 2026-09-22，见 内部调研笔记（未随本仓分发） §10）：端点
+    形态（实测 2026-09-22，见 内部调研笔记目录（未随本仓分发）boss-recommend-card-shape.md §10）：端点
     `GET pc/recommend/job/list.json?page=N&pageSize=15`，响应 `zpData.jobList` + `hasMore`，
     滚动加载每批 15 条——旧实现只吃第一批，故「池子只有 28 条」的结论是采集深度造成的假象。
     """
@@ -1777,7 +1783,7 @@ def _acquire_and_draft_greeting(flow):
     flow.recruiter_active = _extract_recruiter_active(flow.detail)  # grab_detail 成功 ⇒ detail 响应已就位
     request_greeting(ctx.session_dir, idx, job, jd_text, recruiter_active=flow.recruiter_active)
     shot(page, ctx.shots_dir, f"request-{idx}")
-    send_text = wait_reply(ctx.session_dir, idx, timeout=ctx.cfg.get("reply_timeout", 600))
+    send_text = wait_reply(ctx.session_dir, idx, timeout=ctx.cfg.get("reply_timeout", REPLY_TIMEOUT_DEFAULT))
     if send_text == SKIP:
         return _skip_job(flow, "agent_skip", reason=reply_reason(ctx.session_dir, idx))
     if not send_text:
@@ -1961,9 +1967,11 @@ def _type_and_send_greeting(flow):
     fa_listener = capture_xhr(page, "/wapi/zpgeek/friend/add.json", flow.add_response)
     try:
         input_el = flow.input_el
-        is_contenteditable = "contenteditable" in (
-            input_el.evaluate("el => el.tagName + '|' + (el.getAttribute('contenteditable') || '')") or ""
-        )
+        # #68：判据问浏览器本身。旧写法取 `tagName + '|' + contenteditable 属性` 再查串里有没有
+        # "contenteditable" 这个词——`<div contenteditable="true">` 实得 `"DIV|true"`，串里永不含
+        # 那个词 ⇒ 下面 `elif is_contenteditable:` 恒不进，聊天页一律落 `no_send`。
+        # `isContentEditable` 才是真值来源，且顺带覆盖 designMode 容器（与 reply_inbound 同源）。
+        is_contenteditable = bool(input_el.evaluate("el => !!el.isContentEditable"))
         input_el.click()
         time.sleep(random.uniform(0.4, 0.9))
         shot(page, ctx.shots_dir, f"typing-start-{idx}")
@@ -2308,9 +2316,8 @@ def _init_live_session(env):
     cfg["wedge_skip_enabled"] = _wedge_skip_enabled(env)
     ladder_state_path = private_path("data/daily_limit_state.json", prefix)
     cfg["effective_limit"] = effective_daily_limit(cfg, state_path=ladder_state_path)
-    # 默认 1200：agent 起草要读 JD+查白名单+跑四道 gate 自检，600s 在流中断时会误杀
-    # （2026-09-25 实跑 request_6/7 因起草超 600s 被跳过且事后补 reply 无效）
-    cfg["reply_timeout"] = int(env.get("LIVE_REPLY_TIMEOUT", "1200") or "1200")
+    # 默认值的依据与代价写在 `REPLY_TIMEOUT_DEFAULT` 的上方注释里，这里不抄第二份
+    cfg["reply_timeout"] = int(env.get("LIVE_REPLY_TIMEOUT", str(REPLY_TIMEOUT_DEFAULT)) or REPLY_TIMEOUT_DEFAULT)
     # #33：来源配置必须在这里落进 cfg——`_recommend_turn_open` 读的是 cfg["live_recommend"]，
     # 而 load_config 不认识这个键。7 轮实现曾漏掉这一行，结果推荐流轮在生产里恒不执行
     # （测试只直接调 _apply_recommend_cfg，测不到接线），由 test_live_apply 的接线用例兜住。
@@ -3941,6 +3948,12 @@ def _collect_fresh_followup(run, page):
                 "——判为残缺采集（首页截断形态），沿用上次报告不覆盖；收尾 eval 不吃这份残缺数据"
             )
             return
+        # 水位线读数（#75 review 条目 B）：这条路径**整份重写**同一个 followup_report.json，
+        # 两个恒在键必须在这里也落上——投递场次收尾正是用户读这份报告的时刻（「先看哪几条」问的是它）。
+        # 与 followup_tracker / reply_inbound 走同一个 `attach_readings`，判据与措辞不各写一份。
+        # **只读**：读基准、报差值，绝不推进（推进只由 `reply_inbound.py --mark-read`）。
+        wm_name, wm_prefix = resolve_active_profile(env=run.env)
+        wm.attach_readings(report, profile=wm_name, path=str(private_path(wm.WATERMARK_FILE, wm_prefix)))
         # 原子写（#59 二轮）：上一版这里是 `out.write_text(json.dumps(...))`——被中断/并发写时
         # 留下的半写报告正是「读不出基准」的自造来源，而 `_load_wedge_skipped` 那类台账读法
         # 已有自愈回落，这里不该再靠自己制造一次损坏。
