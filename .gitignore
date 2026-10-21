@@ -35,3 +35,6 @@ dist/
 
 # 一次性研究脚本（路径替换有 bug，本地保留但不纳入 git）
 scripts/oneshot/
+
+# 同名软链：`private/` 只匹配目录，这一条才匹配软链本身
+/private

@@ -15,6 +15,7 @@ PII 形态（手机号/证件号/邮箱/绝对本地路径/硬编码年限），
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import subprocess
 import sys
@@ -24,6 +25,7 @@ MARKER = "pii-ok"
 
 BANNED_PATHS = [
     re.compile(r"^private/"),
+    re.compile(r"^private$"),
     re.compile(r"^scripts/oneshot/"),
     re.compile(r"(?i)\.(pdf|docx?|xlsx?|pptx?|png|jpe?g|gif|webp|heic|mp4|webm|mov|avi|sqlite3?|zip|tar\.gz)$"),
     re.compile(r"(?i)(^|/)(app|apply_log)\.log$"),
@@ -150,6 +152,33 @@ def check_paths(files: list[str], findings: list[str]) -> None:
                 break
 
 
+def tracked_symlinks(staged: bool) -> list[str]:
+    """被跟踪的符号链接。
+
+    公开仓里的软链只会指向仓外（本机数据目录），它的 target 就是一串绝对路径，
+    而且 `private/` 这类 ignore 规则按目录匹配、根本挡不住同名软链——所以直接禁。
+    """
+    if staged:
+        rows = git("diff", "--cached", "--raw", "--diff-filter=ACM")
+        out = []
+        for row in rows:
+            fields = row.split()
+            if len(fields) >= 5 and fields[2] == "120000":
+                out.append(fields[-1].split("->")[-1])
+        return out
+    return [r.split("\t", 1)[1] for r in git("ls-files", "-s") if r.startswith("120000 ")]
+
+
+def check_symlinks(files: list[str], findings: list[str]) -> None:
+    for rel in files:
+        target = ""
+        try:
+            target = os.readlink(rel)
+        except OSError:
+            pass
+        findings.append(f"{rel}: 公开仓不得跟踪符号链接（target={target or '读不出'}）")
+
+
 def check_content(files: list[str], denylist: list[str], findings: list[str]) -> None:
     for rel in files:
         path = Path(rel)
@@ -195,6 +224,7 @@ def main() -> int:
     files = files_to_scan(args.staged)
     findings: list[str] = []
     check_paths(files, findings)
+    check_symlinks(tracked_symlinks(args.staged), findings)
     check_content(files, load_denylist(root), findings)
 
     scope = "staged" if args.staged else "tracked"
