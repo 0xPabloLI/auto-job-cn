@@ -1340,3 +1340,58 @@ def test_mark_read_cli_refuses_the_combinations_it_means_to(monkeypatch, tmp_pat
     monkeypatch.setattr(mod, "run_reply", spy)
     assert mod.main(["--mark-read"]) == 1
     assert passed.get("mark_read") is True and passed.get("send") is False, "拒的是组合，不是 --mark-read 本身"
+
+
+# --- 候选表「对方那句原文」的截断可见标记（#66 验收 1 的接线侧） ---
+# 依据是 #66 票面验收①「汇报里恒有逐条公司·岗位·原文」与关票后的订正（这一格当时不带截断标记）。
+# **不是** platforms/chat_first.py 那句「措辞也必须同源」——那句管的是 `STATE_LABELS` 的读态标签名字，
+# 不涵盖截断标记；两边同源的只有判据（`boss.read_state`），窗口各算各的（这边 52、那边 46）。
+
+
+def _table_rows(out):
+    """候选表打出来的 `▸` 行（只取展示层，不经 `_drive`/`run_reply`，因此零浏览器、零发送面）。"""
+    return [ln for ln in out.splitlines() if ln.strip().startswith("▸")]
+
+
+def test_inbound_table_marks_truncated_their_message(capsys):
+    """原文**长于 52 字** ⇒ 行尾要带 `…`（#66 验收 1）：静默截断会把「对方到底说了什么」读成
+    「对方就说完了」，而这一格是 `--send --only <eid>` 点名单条时唯一的现场读数处。
+    候选一律由生产码 `classify` 产出（照 `2a7e7c5` 在 test_followup_tracker 里立的规矩：形状由
+    生产码给，不由夹具手搓），用例只覆盖原文那一格——`CAND` 没有 `source` / `sinceWatermark` /
+    `jobState`，拿它当承重那条的输入等于让展示层读一组生产上不会同时出现的键。
+    两条断言各拦一头：`endswith` 钉版式，`"方" * 53 not in` 钉**真的切了**——只写前者时 53 字
+    的全文行也以同样字符结尾，把生产里的切片整个删掉三条用例照样全绿（本轮 review 查出的洞）。"""
+    cand = mod.classify({"conversations": [_conv(last="方" * 53)]}, {"e1": IDENT_OK}, set())[0]
+    mod.print_inbound_table([cand])
+    rows = _table_rows(capsys.readouterr().out)
+    assert len(rows) == 1, rows
+    assert rows[0].endswith("方" * 52 + "…"), rows[0]
+    assert "方" * 53 not in rows[0], rows[0]
+
+
+def test_inbound_table_leaves_a_message_exactly_at_the_window_unmarked(capsys):
+    """等号边界单独钉：原文**恰好 52 字**时一个字都没被切掉，行尾不许有 `…`。
+    「只把切片改成带标记、判据却写成 `>=`」正是上一轮 review 认定会复发的形态（补标记的条件
+    必须和切片的窗口同源，所以那边收成 `window` 单点绑定后，这里也照同一个条件表达式）。
+    这一条与下一条钉的都是补标记的两个边界，值本身在生产上取得到（`classify` 的 `lastMsg`
+    取值链是 `conv.get("lastMsg") or conv.get("summary") or ""`），所以继续直接在 dict 上覆盖
+    那一格，不必再走一遍 `classify`——形状由生产码给那条规矩管的是承重用例读到的键集。"""
+    exact = "方" * 52
+    mod.print_inbound_table([{**CAND, "lastMsg": exact}])
+    rows = _table_rows(capsys.readouterr().out)
+    assert len(rows) == 1, rows
+    assert rows[0].endswith(exact) and "…" not in rows[0], rows[0]
+
+
+def test_inbound_table_leaves_an_empty_or_missing_message_unmarked(capsys):
+    """原文为空串 / 整键缺失 ⇒ 这一格照旧是空，不加 `…` 也不换成别的措辞（钉现状：
+    「无原文」要不要有个显式占位是另一种设计，本任务不授权）。
+    空串那支是 `classify` 取值链走到底的真实产出；**缺键那支只能是手搓 dict**——`classify`
+    恒写 `lastMsg` 键，生产路径不会交出没有这一格的候选，这里保留它是为了钉展示层用的是
+    `cand.get(...)`：少一个键既不炸、也不静默换成别的写法。"""
+    no_key = {k: v for k, v in CAND.items() if k != "lastMsg"}
+    mod.print_inbound_table([{**CAND, "lastMsg": ""}, no_key])
+    rows = _table_rows(capsys.readouterr().out)
+    assert len(rows) == 2, rows
+    for row in rows:
+        assert row.endswith("对方：") and "…" not in row, row

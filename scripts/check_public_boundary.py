@@ -163,7 +163,8 @@ def tracked_symlinks(staged: bool) -> list[str]:
         out = []
         for row in rows:
             fields = row.split()
-            if len(fields) >= 5 and fields[2] == "120000":
+            # raw 格式 `:<旧模式> <新模式> <旧sha> <新sha> <状态>\t<路径>`——新模式是第 2 个字段
+            if len(fields) >= 5 and fields[1] == "120000":
                 out.append(fields[-1].split("->")[-1])
         return out
     return [r.split("\t", 1)[1] for r in git("ls-files", "-s") if r.startswith("120000 ")]

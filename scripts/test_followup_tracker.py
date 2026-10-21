@@ -786,6 +786,9 @@ def test_run_marks_truncated_inbound_summary_with_visible_ellipsis(tmp_path, mon
 
     long_row = row_of("长句公司")
     assert long_row.endswith("我" * 46 + "…"), long_row
+    # 只断 `endswith` 拦不住「不截断、只补标记」：60 字的全文行也以同样那 46 字收尾（同一形态
+    # 在 reply_inbound 那边也被查出过），所以等式另一头要钉「确实被切掉了」。
+    assert "我" * 47 not in long_row, long_row
     short_row = row_of("短句公司")
     assert short_row.endswith("方便发份简历吗") and "…" not in short_row, short_row
     empty_row = row_of("无摘要公司")

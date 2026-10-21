@@ -803,15 +803,23 @@ def print_inbound_table(candidates):
     只报事实与判据，不替用户决定回不回——回不回由起草侧的 `{"skip": true}` 或当次授权表达。
     最后一列是水位线（#75）：`线上新` = 上次读数之后才出现或才动的、且末条不是我方的那条，
     「先看哪几条」看这一列，不看 `unreadMsgCount`（那个字段已被实测否证）。基准不可用时整列
-    是 `线以下`，此时以 `[水位线]` 那行的 `state` 措辞为准（首跑/损坏/串档各有各的处置）。"""
+    是 `线以下`，此时以 `[水位线]` 那行的 `state` 措辞为准（首跑/损坏/串档各有各的处置）。
+    原文那格截到窗口但不静默截断：长于窗口行尾补 `…`，短于或等于不加——依据是 #66 票面验收①
+    「汇报里恒有逐条公司·岗位·原文」与关票后的订正（这一格当时「不带任何截断标记」）。与
+    `followup_tracker` 的 `[入站线索]` 清单**只共享判据**（`boss.read_state` 与 `STATE_LABELS`），
+    窗口各算各的：本行还带取号用的 `encryptJobId` 与水位线列，所以是 52 而非那边的 46。
+    `chat_first.py` 那句「措辞也必须同源」只管读态标签的**名字**，不涵盖截断标记。"""
+    window = 52
     for cand in candidates:
         mark = "可回" if cand.get("eligible") else f"跳过：{cand.get('skip')}"
         read = STATE_LABELS.get(cand.get("readState"), "读态未知")
         line = "线上新" if cand.get("sinceWatermark") else "线以下"
+        msg = cand.get("lastMsg") or ""
         print(
             f"  ▸ [{mark}] {cand.get('encryptJobId')} {cand.get('company')} | "
             f"{cand.get('jobTitle') or '（身份未反查）'} | {read} | {line} | "
-            f"对方：{(cand.get('lastMsg') or '')[:52]}"
+            f"对方：{msg[:window]}"
+            f"{'…' if len(msg) > window else ''}"
         )
 
 
