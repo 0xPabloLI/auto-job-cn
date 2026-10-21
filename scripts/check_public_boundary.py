@@ -43,7 +43,10 @@ FORBIDDEN_DOCS = [
 ]
 
 CONTENT_SCANS = [
-    ("cn_mobile", re.compile(r"(?<!\d)1[3-9]\d{9}(?!\d)")),
+    # `(?:\+?86[-\s]?)?` 让 +86 连写也算命中（旧写法 `(?<!\d)` 会把 `+8613800001111` 判成  # pii-ok
+    # 「前面是数字」而漏掉）；两侧 lookaround 保留，长数字串里不误报。
+    # 「前面是数字」而漏掉）；两侧 lookaround 保留，长数字串里不误报。
+    ("cn_mobile", re.compile(r"(?<!\d)(?:\+?86[-\s]?)?1[3-9]\d{9}(?!\d)")),
     (
         "cn_id_card",
         re.compile(r"(?<![\dXx])[1-9]\d{5}(?:19|20)\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])\d{3}[\dXx](?![\dXx])"),
@@ -65,7 +68,12 @@ SAFE_EMAIL_DOMAINS = {
     "example",
 }
 SAFE_PATH_USERS = {"example", "user", "runner", "pablo", "<user>", "name"}
-SAFE_MOBILE = {"13812345678", "13800138000", "13900139000", "15000000000", "18888888888"}
+
+# 带分隔符的 3-4-4 写法（连字符或空格分组）单独一条，且只在同一行出现语境词时才生效：
+# 无条件放开会把时间戳、坐标、长数字串全卷进来，误报会把这条守卫训成噪声。
+MOBILE_SEPARATED = re.compile(r"(?<!\d)(?:\+?86[-\s]?)?1[3-9]\d[-\s]\d{4}[-\s]\d{4}(?!\d)")
+PHONE_CONTEXT = re.compile(r"(?i)(tel|phone|mobile|手机|电话|联系|号码)")
+# 刻意不设「安全号码常量」：按值放行是全仓生效的洞；合成夹具用行内标记，只豁免那一行。
 
 
 PLACEHOLDER_MARKS = ("sample", "example", "示例", "占位", "test_")
@@ -198,8 +206,6 @@ def check_content(files: list[str], denylist: list[str], findings: list[str]) ->
                     value = match.group(0)
                     if kind == "resume_file" and _is_placeholder(value):
                         continue
-                    if kind == "cn_mobile" and value in SAFE_MOBILE:
-                        continue
                     if kind == "email" and value.split("@", 1)[1].lower() in SAFE_EMAIL_DOMAINS:
                         continue
                     if kind == "local_path":
@@ -207,6 +213,9 @@ def check_content(files: list[str], denylist: list[str], findings: list[str]) ->
                         if user in SAFE_PATH_USERS or user.startswith(("runner", "vsts")):
                             continue
                     findings.append(f"{rel}:{lineno} [{kind}] {mask(value)}")
+            if PHONE_CONTEXT.search(line):
+                for match in MOBILE_SEPARATED.finditer(line):
+                    findings.append(f"{rel}:{lineno} [cn_mobile] {mask(match.group(0))}")
             for term in denylist:
                 if term in line:
                     findings.append(f"{rel}:{lineno} [denylist] {mask(term)}")
