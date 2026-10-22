@@ -98,7 +98,7 @@ WAPI_MINE_DELIVERED = {  # 我方最后发言未读（[送达]）
     "encryptJobId": "40cde3336736a7a30nF93Ni1EVBQ",
 }
 WAPI_HR_REPLY = {  # HR 最后发言（真实回复文本）
-    "name": "汐女士",
+    "name": "砚女士",
     "brandName": "煦辰",
     "title": "招聘者",
     "lastMsg": "对你的简历很感兴趣，期待深入交流。",
@@ -119,16 +119,16 @@ DOM_CHIP = {  # 带状态徽标 = 我方最后发言
 }
 DOM_NO_CHIP = {  # 无徽标 = HR 最后发言
     "time": "09月09日",
-    "name": "汐女士",
-    "name_box": "汐女士煦辰招聘者",
+    "name": "砚女士",
+    "name_box": "砚女士煦辰招聘者",
     "status": None,
     "status_read": False,
     "last_msg": "对你的简历很感兴趣，期待深入交流。",
 }
 DOM_NO_CHIP_2 = {  # 无徽标，品牌 4 字（match_brand min_len 下限之上，可回填）
     "time": "09月08日",
-    "name": "澄女士",
-    "name_box": "澄女士昀洵网络人事专员",
+    "name": "蓝女士",
+    "name_box": "蓝女士昀洵网络人事专员",
     "status": None,
     "status_read": False,
     "last_msg": "简历已收到，合适会联系您[抱拳]",
