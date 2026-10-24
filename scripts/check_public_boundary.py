@@ -141,9 +141,12 @@ def denylist_source(root: Path) -> tuple[Path, str]:
     return (Path(env), "env") if env else (root / "private/pii_denylist.txt", "fallback")
 
 
-def load_denylist(root: Path) -> list[str]:
-    """已知个人标识清单：一行一个已知个人标识，短于 3 字与注释行不计。"""
-    path, _ = denylist_source(root)
+def usable_terms(path: Path) -> list[str]:
+    """从一份清单文件数出可用词条：一行一个已知个人标识，短于 3 字与注释行不计。
+
+    「可用词条」的定义只有这一处（#113）——提升链的真门经 importlib 载入本模块调它，
+    别在 promote 里另写一套 ≥3 字/非注释规则。
+    """
     if not path.is_file():
         return []
     terms = []
@@ -152,6 +155,12 @@ def load_denylist(root: Path) -> list[str]:
         if term and not term.startswith("#") and len(term) >= 3:
             terms.append(term)
     return sorted(terms, key=len, reverse=True)
+
+
+def load_denylist(root: Path) -> list[str]:
+    """已知个人标识清单：解析来源路径后交给 `usable_terms()`（一份定义）。"""
+    path, _ = denylist_source(root)
+    return usable_terms(path)
 
 
 def check_paths(files: list[str], findings: list[str]) -> None:

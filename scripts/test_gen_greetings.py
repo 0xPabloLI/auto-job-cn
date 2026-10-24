@@ -130,7 +130,7 @@ def test_cmd_promote_reports_kept_sent(tmp_path, capsys, monkeypatch):
 
 
 def test_match_brand_substring_both_ways():
-    assert mod.match_brand("榆女士上海珀澜科技HR", "上海珀澜科技")
+    assert mod.match_brand("槿女士上海珀澜科技HR", "上海珀澜科技")
     assert mod.match_brand("珀淞区块链", "北京珀淞区块链有限公司")
     assert not mod.match_brand("A公司", "B公司")
     assert not mod.match_brand("短", "短")  # 长度守卫
@@ -141,7 +141,7 @@ def test_build_memory_replied_detection():
         "totalConversations": 3,
         "hrReplied": 1,
         "conversations": [
-            {"company": "榆女士上海珀澜科技HR", "summary": "[送达] 7年Solidity", "status": "awaiting"},
+            {"company": "槿女士上海珀澜科技HR", "summary": "[送达] 7年Solidity", "status": "awaiting"},
             {"company": "上海珀澜科技有限公司HR", "summary": "好的，聊聊", "status": "hr_replied"},
             {"company": "珀淞区块链HR", "summary": "方便发简历吗", "status": "hr_replied"},
         ],
@@ -619,7 +619,7 @@ def test_join_eval_records_brand_fallback_1to1_consumption():
     report = {
         "conversations": [
             {"company": "甲子光年公司HR砚女士", "summary": "聊聊？", "status": "hr_replied"},
-            {"company": "甲子光年公司HR竹先生", "summary": "[送达]", "status": "awaiting"},
+            {"company": "甲子光年公司HR桐先生", "summary": "[送达]", "status": "awaiting"},
         ]
     }
     greetings = [

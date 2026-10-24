@@ -504,7 +504,7 @@ def test_reply_one_deeplink_lands_wrong_conversation_is_conv_unreachable(monkeyp
     """深链打开的**不是这条对话**（右侧会话头对不上）⇒ 独立桶 `conv_unreachable` + 存证。
     不许冒充 `conv_not_found`（那是「列表里没有这条」，与「打开时被站点换走了」是两回事），
     更不许往下走：一个字都不打。"""
-    wrong = "五女士江西劲希网络科技HR"
+    wrong = "六女士江西劲希网络科技HR"
     page = _target_page(header=wrong)
     ctx = _ctx(tmp_path)
     ctx.platform = _FakePlatform(_report())
@@ -883,7 +883,7 @@ def test_send_refuses_when_only_matches_multiple_conversations(monkeypatch, tmp_
     """同一 `encryptJobId` 对应两条会话（同岗多招聘者）时，`--only` 只给了一个 id 也分不清
     该开哪一位；开哪条都是猜，所以发前就停、两条都落 `conv_ambiguous`，`reply_one` 一次不调。"""
     page = _FakeDeeplinkPage()
-    other = {**HR_INBOUND, "name": "竹先生", "brandName": "别家", "title": "HR", "encryptUid": "enc-uid-2"}
+    other = {**HR_INBOUND, "name": "桐先生", "brandName": "别家", "title": "HR", "encryptUid": "enc-uid-2"}
     tried = []
     monkeypatch.setattr(mod, "startup_jitter", lambda cfg, **k: None)
     monkeypatch.setattr(
@@ -1027,7 +1027,7 @@ def test_report_always_carries_the_watermark_keys(monkeypatch, tmp_path):
     assert report["watermark"]["state"] == "first_run"
 
 
-HR_LATER = {**HR_INBOUND, "encryptJobId": "e2", "name": "竹先生", "brandName": "别家", "lastTS": 1792999999000}
+HR_LATER = {**HR_INBOUND, "encryptJobId": "e2", "name": "桐先生", "brandName": "别家", "lastTS": 1792999999000}
 PREVIOUS_READ = "2026-10-19 09:00:00"  # 「上次读数」的时刻（本场快照固定是 2026-10-20 18:00:00）
 
 
@@ -1081,7 +1081,7 @@ def test_mark_read_echo_separates_read_listed_and_recorded_counts(monkeypatch, t
     **本次读到的整批**（没被列出的那些也算看过——只推列出的那几条会让其余每场重复提醒）。
     三个数各是各的意思，所以这场故意让它们互不相等：读到 3、列出 2、记入 3、线上新 1。"""
     _seed_watermark(tmp_path, [HR_INBOUND])
-    ours = {**HR_INBOUND, "encryptJobId": "e9", "name": "汀先生", "lastMessageInfo": {"fromId": MY_UID, "status": 1}}
+    ours = {**HR_INBOUND, "encryptJobId": "e9", "name": "澜先生", "lastMessageInfo": {"fromId": MY_UID, "status": 1}}
     report, _ = _drive_readonly(monkeypatch, tmp_path, [HR_INBOUND, HR_LATER, ours], mark_read=True)
     out = capsys.readouterr().out
     assert "本次读到 3 条会话、候选清单列出 2 条、记入 3 个会话键（较上次读数新增 1 条）" in out, out

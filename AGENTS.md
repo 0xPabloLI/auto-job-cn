@@ -26,8 +26,9 @@
   salary floor, target industry, real company/HR names, platform probing notes) live only
   under `private/` and never get committed, logged or quoted. Before any commit or release,
   run `python3 scripts/check_public_boundary.py` (also wired into `.githooks/pre-commit`).
-- Public repo is generated, not edited: promote with `python3 /path/to/user/Documents/code/.auto-job-publish/promote_public.py`
+- Public repo is generated, not edited: promote with `python3 scripts/publish/promote_public.py`
   （私有主线 → 脱敏快照 → 全闸门 → 用户确认 → push）。绝不手改公开 checkout，也不把私有提交直接推 public。
+  改 `scripts/publish/` 或公开侧守卫前读 `内部发布链文档（未随本仓分发）`。
 
 ## Collaboration Preferences
 

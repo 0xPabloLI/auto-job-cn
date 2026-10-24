@@ -128,8 +128,8 @@ DOM_NO_CHIP = {  # 无徽标 = HR 最后发言
 }
 DOM_NO_CHIP_2 = {  # 无徽标，品牌 4 字（match_brand min_len 下限之上，可回填）
     "time": "09月08日",
-    "name": "蓝女士",
-    "name_box": "蓝女士昀洵网络人事专员",
+    "name": "翠女士",
+    "name_box": "翠女士昀洵网络人事专员",
     "status": None,
     "status_read": False,
     "last_msg": "简历已收到，合适会联系您[抱拳]",
