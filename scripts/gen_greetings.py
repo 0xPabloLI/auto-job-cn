@@ -38,10 +38,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _atomic_io import write_text_atomic  # noqa: E402  （scripts 平铺导入，同 _llm.py）
 from _edd import (  # noqa: E402  #37 EDD 趋势观测；stamp/parse_ts 别名复用（review J1 去重）
     TREND_APPENDED,  # #59 修复轮 R4-5：append_trend 的返回状态（判序只有一份，长在咽喉里）
+    TREND_APPENDED_DECLINE,  # #63 验收 4：已落盘但样本数低于最新一条（不静默，措辞单列一格）
     TREND_DUPLICATE,
     TREND_FALSE_ZERO,
     append_trend,
     density_due,  # #45 密度提示判定（record_session_snapshot 透传 + eval 命令接线）
+    is_appended,  # #63 切片 B：「写没写盘」的**唯一问法**（判序不许复制到调用方，R4-5 同一条纪律）
     load_pending_candidates,  # #45：候选审阅建议清单
     load_trend,
     parse_ts as _parse_stamp,
@@ -52,6 +54,7 @@ from _edd import (  # noqa: E402  #37 EDD 趋势观测；stamp/parse_ts 别名�
     trend_snapshot,
 )
 from _limits import notify  # noqa: E402  #45：密度达标的 macOS 系统通知（复用，不自造通知通道）
+import _followup_shape as fshape  # noqa: E402  #63 切片 B：趋势快照的分母（报告条数 + 位置签名）
 from _profile_paths import (  # noqa: E402  #28：私有路径唯一出口，全函数化
     private_path,
     profile_line,
@@ -996,19 +999,28 @@ def pending_prune(data, now=None, max_age_days=PENDING_MAX_AGE_DAYS):
     return {"updated_at": (data or {}).get("updated_at"), "candidates": keep}
 
 
-def persist_eval_output(out, evaluation_path, trend_path, pending_path, profile, now=None):
+def persist_eval_output(out, evaluation_path, trend_path, pending_path, profile, now=None, denominator=None):
     """eval 产物持久化组合（#37）：评估报告写盘 + 趋势快照追加（无论 sufficient 与否，
     拍板 Q7；0 样本假零由 _edd.append_trend 咽喉拦下）+ 非空候选入待审队列（幂等去重 +
     超龄清理）。
-    返回 (待审条数, 本次快照, 趋势写入状态)——状态就是 `_edd.append_trend` 的返回值
-    （`TREND_APPENDED` / `TREND_DUPLICATE` / `TREND_FALSE_ZERO`）。
+    返回 (待审条数, 本次快照, 趋势写入状态, append 前的趋势历史)——第 3 项就是
+    `_edd.append_trend` 的返回值（`TREND_APPENDED` / `TREND_APPENDED_DECLINE` /
+    `TREND_DUPLICATE` / `TREND_FALSE_ZERO`），第 4 项是本次追加**之前**读到的历史列表
+    （`render_trend_table` 契约要求不含 current，#82）。
     #59 诚实性：`eval --trend` 过去无条件打「趋势快照已追加」，被拒时说的是假话——追加结果必须传出来。
     #59 修复轮 R4-5：第 3 项从 bool 改成状态字符串。旧形态为了区分「被拒的两类原因」在这里
     `false_zero_snapshot(load_trend(trend_path), snapshot)` 自己又判一遍，判序因此在咽喉与调用方
     各存一份：① 「幂等跳过」与「假零」同时成立时，这里报的是假零而咽喉实际按幂等跳过处理；
-    ② 两次读 trend 之间没有锁，理论上能读到不同内容。现在调用方只读状态，判序只有一份。"""
+    ② 两次读 trend 之间没有锁，理论上能读到不同内容。现在调用方只读状态，判序只有一份。
+    `denominator`（#63 切片 B 验收 4）：这条快照的分母读数（会话清单条数 + 位置签名，由
+    `_followup_shape.denominator(报告)` 造），调用方给不出就是 `None`——趋势里那一格照常在、
+    值为 None，不补 0。"""
     _write_json(evaluation_path, out)
-    snapshot = trend_snapshot(out, profile=profile, now=now)
+    snapshot = trend_snapshot(out, profile=profile, now=now, denominator=denominator)
+    # #82：历史必须取 append **之前**那份并由这里交出去，契约见 `_edd.render_trend_table`
+    # docstring。只读，不判（判序在咽喉里；#63 新增的 `appended_decline` 也算写了，
+    # 「写没写盘」由 `_edd.is_appended` 一处问）。
+    history = load_trend(trend_path)
     trend_status = append_trend(trend_path, snapshot)
     candidates = out.get("candidates", {}).get("winning", []) + out.get("candidates", {}).get("losing", [])
     if candidates:
@@ -1019,14 +1031,20 @@ def persist_eval_output(out, evaluation_path, trend_path, pending_path, profile,
         queue = _load_json(pending_path, None)
         if queue is not None:
             _write_json(pending_path, pending_prune(queue, now=now))
-    return len(queue["candidates"]) if queue else 0, snapshot, trend_status
+    return len(queue["candidates"]) if queue else 0, snapshot, trend_status, history
 
 
-# `_edd.append_trend` 的返回状态 → `eval --trend` 终端措辞（动词 + 括注）。三个取值都在这儿列全：
+# `_edd.append_trend` 的返回状态 → `eval --trend` 终端措辞（动词 + 括注）。四个取值都在这儿列全：
 # 咽喉拒写的两类原因不同（幂等跳过 ≠ 疑似残缺采集），把它们混成一句「未追加」就又回到
-# #59 修之前的谎报。未知状态由调用点兜底成「未追加（未知状态 …）」，不谎报「已追加」。
+# #59 修之前的谎报；#63 验收 4 又加一格——**已写盘**但样本数低于最新一条，动词仍是「已追加」，
+# 括注必须点名下降，否则「样本 59→52」在终端上与一场正常会话一模一样。
+# 未知状态由调用点兜底成「未追加（未知状态 …）」，不谎报「已追加」。
 _TREND_STATUS_WORDING = {
     TREND_APPENDED: ("已追加", "（#37）"),
+    TREND_APPENDED_DECLINE: (
+        "已追加",
+        "（样本数低于最新一条——不静默：趋势里带着这条的分母与签名，#63 验收 4）",
+    ),
     TREND_FALSE_ZERO: ("未追加", "（0 样本而历史已有非 0 点，疑似残缺采集——不往趋势里写假零点，#59）"),
     TREND_DUPLICATE: ("未追加", "（与最新一条内容相同，幂等跳过）"),
 }
@@ -1046,6 +1064,9 @@ def record_session_snapshot(paths, profile, now=None):
     `.get(...) or {}`，缺键时那一整块提示判定在消费侧直接消失，而消费方分辨不了「没有键」与
     「判定为否」。两个早退出口（无 followup / 空报告）在 eval 之前，没有 eval 输出可判，
     因此不带这两键（既有语义，`edd_wrapup` 按缺键走）。
+    **#82 再加一键 `trend_history`**（同两个出口都带）：append **之前**读到的趋势历史，
+    `live_apply.edd_wrapup` 渲染趋势块时取走即用 `pop` 掉——它是一次性渲染输入，不进 report.json
+    的 `edd` 字段（趋势文件会一直长，每场报告里嵌一份既没必要也放大汇报读取成本）。
     异常不在此吞（调用方 live_apply 收尾 try/except 兜底，保证故障可感知）。"""
     followup_data = _load_json(paths["followup"], {}) if Path(paths["followup"]).exists() else None
     if followup_data is None:
@@ -1057,9 +1078,17 @@ def record_session_snapshot(paths, profile, now=None):
         return {"trend_appended": False, "reason": "empty followup report"}
     annotations = _load_json(paths["annotations"], {}).get("annotations", [])
     out = eval_greetings(followup_data, _load_json(paths["greetings"], []), annotations, now=now)
-    snapshot = trend_snapshot(out, profile=profile, now=now)
-    # 追加**前**读一次历史，只喂两件事：① 拒写分支的 `review_due`（此刻快照没入账，按既有语义
-    # 吃历史算），② 假零 reason 里的「最新样本数」。判定不在这里做（判序只有一份，在咽喉里）。
+    # 分母读数（#63 切片 B 验收 4）：这条快照是在多少条会话、什么位置签名下算出来的。
+    # 取的是**刚 eval 的那份报告**本身（`followupLedger` 由两个 writer 落进报告；旧报告没这一格
+    # 时条数仍在、签名为 None），拿不到才是 None——绝不补 0。两个写趋势的入口都接上，
+    # 只接一个就重演 #75 review 条目 B（恒在键恰在用户真读的那条路上破了）。
+    denominator = fshape.denominator(followup_data)
+    snapshot = trend_snapshot(out, profile=profile, now=now, denominator=denominator)
+    # 追加**前**读一次历史，喂三件事：① 两个分支的 `review_due`（#82：都吃这份 append 前的历史，
+    # 旧写法在追加成功后又 `load_trend` 一次，`trend[-1]` 是本场快照自己 ⇒ `step` 恒 0，
+    # 「样本较上次记录新增 ≥10」这条批次级审阅提示（#37 拍板 Q1）在正常收尾路径永不触发），
+    # ② 假零 reason 里的「最新样本数」，③ 交出去给渲染方用的 `trend_history`
+    # （#82：`render_trend_md` 的 `trend` 契约是不含 current 的历史）。判定不在这里做（判序只有一份，在咽喉里）。
     history = load_trend(paths["trend"])
     trend_status = append_trend(paths["trend"], snapshot)
     # `density_due` 吃的是**本次 eval 输出 `out`**、与趋势有没有写入无关——被拒的那一场照样有
@@ -1069,7 +1098,12 @@ def record_session_snapshot(paths, profile, now=None):
     # （该形态下多半 due=False，但「消费方拿不到键」与「判定为否」是两件事——消费侧分辨不了，
     # 注释更不能声称不受影响）。
     density = density_due(out)
-    if trend_status != TREND_APPENDED:
+    # #63 切片 B：「写没写盘」只问 `is_appended`（`appended_decline` 也是写了）。
+    # 旧写法 `trend_status != TREND_APPENDED` 会把一场样本变少但真实落盘的会话读成拒写分支，
+    # 于是给它编一句「未追加」的 reason——正是 #59 诚实性要消灭的那类假话的反方向。
+    # `trend_status` 一并进返回体：`live_apply.edd_wrapup` 出 decline 那句点名用的就是它，
+    # 判序不在消费侧复制第二遍。
+    if not is_appended(trend_status):
         latest_size = (history[-1] or {}).get("sampleSize") if history else None
         reason = (
             f"0 样本而趋势历史已有非 0 点（最新 {latest_size} 样本）——疑似残缺采集，不追加趋势以免写进假零点"
@@ -1078,13 +1112,23 @@ def record_session_snapshot(paths, profile, now=None):
         )
         return {
             "trend_appended": False,
+            "trend_status": trend_status,
             "reason": reason,
             "snapshot": snapshot,
             "review_due": review_due(snapshot, history, now=now),
             "density_due": density,
+            "trend_history": history,
         }
-    verdict = review_due(snapshot, load_trend(paths["trend"]), now=now)
-    return {"trend_appended": True, "snapshot": snapshot, "review_due": verdict, "density_due": density}
+    # #82：与拒写分支同源——批次数按 append 前的历史算，本场快照自己不能当「上次记录」。
+    verdict = review_due(snapshot, history, now=now)
+    return {
+        "trend_appended": True,
+        "trend_status": trend_status,
+        "snapshot": snapshot,
+        "review_due": verdict,
+        "density_due": density,
+        "trend_history": history,
+    }
 
 
 def promote_gate(gaps, yes=False):
@@ -1186,13 +1230,18 @@ def _cmd_eval(args, paths):
         print(f"[跳过] {paths['followup']} 不存在——先运行 followup_tracker.py")
         return
     annotations = _load_json(paths["annotations"], {}).get("annotations", [])
-    out = eval_greetings(_load_json(paths["followup"], {}), _load_json(paths["greetings"], []), annotations)
-    pending_n, snapshot, trend_status = persist_eval_output(
+    # `followup_data` 要留一份变量：分母读数取自**刚 eval 的那份报告**，不是事后重读（#63 验收 4）
+    followup_data = _load_json(paths["followup"], {})
+    out = eval_greetings(followup_data, _load_json(paths["greetings"], []), annotations)
+    pending_n, snapshot, trend_status, history = persist_eval_output(
         out,
         evaluation_path=paths["evaluation"],
         trend_path=paths["trend"],
         pending_path=paths["pending"],
         profile=paths["name"] or "default",
+        # #63 切片 B 验收 4：eval 这条入口也带分母——两个写趋势的入口只接一个，
+        # 恒在键就恰在用户真读的那条路上破（#75 review 条目 B 同病）。
+        denominator=fshape.denominator(followup_data),
     )
     # #59 诚实性：措辞跟着 append_trend 的**返回状态**走，不再一律打「已追加」，也不再在这里
     # 自己重判一遍假零（R4-5：判序只有咽喉那一份——旧写法在「幂等跳过 + 假零」同时成立时报的是
@@ -1208,7 +1257,9 @@ def _cmd_eval(args, paths):
     if not out["sufficient"]:
         print("  [样本不足] 总量未达门槛，不出结论——继续投递积累样本（趋势照常记录）")
     if args.trend:
-        print(render_trend_table(snapshot, load_trend(paths["trend"])))
+        # #82：吃 `persist_eval_output` 交出的 append 前历史，这里不自己再 load——契约见
+        # `_edd.render_trend_table` docstring。
+        print(render_trend_table(snapshot, history))
     for c in out["candidates"]["winning"]:
         print(f"  [正例候选] {c['key']} | {c['replyRate']:.0%}（样本 {c['sample']}）")
     for c in out["candidates"]["losing"]:

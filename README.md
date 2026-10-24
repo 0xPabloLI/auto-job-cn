@@ -86,7 +86,7 @@ https://github.com/user-attachments/assets/da4e9911-cb6c-481a-bde4-4eecf51fa05e
   ├ 简历 + 作品材料            ├ 点卡片进详情看 JD                ├ 统计回复率
   ├ 个人层（锚点/硬事实/禁写）  ├ agent 实时起草                  ├ agent 分类标注 HR 回复
   ├ 行业归类 + 背景调研→行业层  ├ 脚本发送前强制四道 gate         ├ learn 回写记忆
-  ├ 事实卡片 + 白名单（gate 表）├ 粘贴/逐字发送 + 全程录屏         │  （下一轮起草更懂你）
+  ├ 事实卡片 + 白名单（gate 表）├ 粘贴/逐字发送 + 动作截图         │  （下一轮起草更懂你）
   ├ skills 校验 + 登录引导      ├ 节奏/日上限/静默/熔断内置        └ eval 分组回复率
   └ 每步机械核验                └ 台账去重防重复投递                （正/反例回写走人工确认）
      scripts/onboarding_check.py
@@ -104,7 +104,7 @@ live_apply.py         实时投递（唯一路径）：搜索列表点卡片进�
                       → 粘贴/逐字打字发送；
                       内置节流：会话式节奏 + 自动阶梯日上限 + 静默时段（默认 0-7 点）+ 熔断；
                       进程外双看门狗（起飞前自检 + 会话中途心跳，协议楔死整树止损）；
-                      全程 webm 录屏 + 动作截图，结束后按动作时刻自动剪辑（trim_live_video.py）
+                      动作截图 shots/ 逐岗留证（取证三件套与落空现场都吃它）
     ↓ 消费同一台账 applied_history.json（去重防重复投递）
 followup_tracker.py   遍历消息列表统计 HR 回复率（linkedReplied 为核心指标）
     ↓ followup_report.json → agent 分类标注（#19/#21）→ gen_greetings.py learn 回写记忆

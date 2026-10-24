@@ -21,10 +21,23 @@ REVIEW_STALE_DAYS = 3
 # --- `append_trend` 的返回状态（#59 修复轮 R4-5：判序只有一份，长在咽喉里）---
 # 旧版返回 bool，两个写趋势的调用方要各自再读一遍趋势历史才能出可读文案，判序因此在三处各存
 # 一份；当「幂等跳过」与「假零」同时成立时 eval 侧报成假零，与咽喉内部判序相反。
-# 现在调用方只读状态字符串出 reason；需要 bool 语义时写 `status == TREND_APPENDED`。
+# 现在调用方只读状态字符串出 reason；需要「写没写盘」这个布尔语义时**只问 `is_appended`**。
 TREND_APPENDED = "appended"  # 已落盘
+TREND_APPENDED_DECLINE = "appended_decline"  # 已落盘，但样本数低于趋势里最新一条（#63 验收 4：不静默）
 TREND_DUPLICATE = "duplicate"  # 与最新一条内容相同（除 ts）——幂等跳过（判序在前）
 TREND_FALSE_ZERO = "false_zero"  # 0 样本而历史已有非 0 点——#59 防线 2 拦下
+
+# 「写没写盘」只有一个问法：两个状态都算写了，decline 只是**额外的状态**，不是拒绝。
+# 调用方不许自己再比一次 sampleSize（那正是 R4-5 收口掉的「判序复制到调用方」）。
+APPENDED_STATUSES = (TREND_APPENDED, TREND_APPENDED_DECLINE)
+
+
+def is_appended(status) -> bool:
+    """这个 `append_trend` 的返回状态代表**已落盘**吗（唯一问法，#63 切片 B）。
+    两个写趋势的调用方（`gen_greetings.record_session_snapshot` / `live_apply.edd_wrapup`）都问它，
+    别再写 `status == TREND_APPENDED`——那样 `appended_decline` 会被读成「没写」，
+    一场真实但样本变少的会话就被报成跳过快照。"""
+    return status in APPENDED_STATUSES
 
 
 def stamp(now):
@@ -35,9 +48,14 @@ def stamp(now):
     return (now or datetime.now()).isoformat(timespec="seconds")
 
 
-def trend_snapshot(evaluation, profile, now=None):
+def trend_snapshot(evaluation, profile, now=None, denominator=None):
     """eval_greetings 输出 → 一条趋势快照（时序字段 + 分组回复率）。
-    组内样本不足的组 replyRate=None 原样保留——观测层不替评估层补结论。"""
+    组内样本不足的组 replyRate=None 原样保留——观测层不替评估层补结论。
+    `denominator`（#63 切片 B 验收 4）：这条快照是在什么分母下算出来的——
+    `{"conversations": <报告条数>, "shape": <位置签名>}`（由 `_followup_shape.denominator` 造，
+    两个写趋势的入口都接上）。拿不到就落 `None`，**不补 0**（0 是一条读数，None 才是「这一格
+    这次没有读数」，口径同 #61 的 `source=null`）。有它才答得出「样本从 59 掉到 52 是因为会话
+    清单少了 24 条，还是因为配对率变了」；没它就只能事后翻报告反推。"""
     groups = evaluation.get("groups", {})
 
     def rates(dim):
@@ -52,6 +70,7 @@ def trend_snapshot(evaluation, profile, now=None):
         "minTotal": evaluation.get("minTotal"),
         "by_addressee": rates("by_addressee"),
         "by_pattern": rates("by_pattern"),
+        "denominator": denominator,
     }
 
 
@@ -75,8 +94,32 @@ def load_trend(path):
 
 
 def _content_key(snapshot):
-    """去重键：除 ts 外的完整内容——同内容快照不重复入时序（重复会话收尾不刷屏）。"""
+    """去重键：除 ts 外的**完整内容**——同内容快照不重复入时序（重复会话收尾不刷屏）。
+    #63 切片 B 起这一句的含义变了，是**目的不是副作用**，别当回归改回去：加了 `denominator`
+    之后「同样本数、不同分母」（会话清单条数变了、签名变了，配对样本恰好没变）**不再是 duplicate**，
+    会照常追加一条。票面验收 4 要的就是「样本数下降时趋势里看得见分母与签名」，
+    把它压成幂等跳过就等于把这条读数抹掉。历史条目没有 `denominator` 键，
+    所以带它的首条新快照必然追加一次（那是键集合变化，不是 duplicate 判据坏了）。"""
     return json.dumps({k: v for k, v in snapshot.items() if k != "ts"}, sort_keys=True, ensure_ascii=False)
+
+
+def _size_of(item):
+    """条目的 `sampleSize` 只在**真的是 int** 时参与比较（`True` 也满足 isinstance(int)，显式排除；
+    None / 串 / 缺键一律 None＝不参与），方向与 #59 假零判据同保守。"""
+    if isinstance(item, dict):
+        value = item.get("sampleSize")
+        if not isinstance(value, bool) and isinstance(value, int):
+            return value
+    return None
+
+
+def sample_declined(snapshot, trend):
+    """本场样本数**低于趋势里最新一条**吗（#63 验收 4 的那一眼，纯判据；调用方是 `append_trend`）。
+    历史为空（冷启动首点）、任一侧读数不是整数 ⇒ False——判不出就不宣布「下降」，
+    趋势的第一条永远没有可比对象，把「无从比较」念成「样本下降」是新造的谎。"""
+    current = _size_of(snapshot)
+    previous = _size_of(trend[-1]) if trend else None
+    return current is not None and previous is not None and current < previous
 
 
 def false_zero_snapshot(trend, snapshot):
@@ -96,25 +139,29 @@ def false_zero_snapshot(trend, snapshot):
 
 
 def append_trend(path, snapshot):
-    """追加一条快照，返回**状态字符串**（`TREND_APPENDED` / `TREND_DUPLICATE` / `TREND_FALSE_ZERO`；
-    #59 修复轮 R4-5：旧版返回 bool，逼着两个调用方各自再读一遍趋势历史才能出可读文案，
+    """追加一条快照，返回**状态字符串**（`TREND_APPENDED` / `TREND_APPENDED_DECLINE` /
+    `TREND_DUPLICATE` / `TREND_FALSE_ZERO`；#59 修复轮 R4-5：旧版返回 bool，逼着两个调用方各自再读一遍趋势历史才能出可读文案，
     判序因此在三处各存一份。现在判序只有这一份，调用方按状态出 reason/措辞）。
     两种情况不写，且**判序就是返回值的优先级**：
     ① `TREND_DUPLICATE`——与最新一条内容相同（除 ts）：幂等跳过，重复会话收尾不刷屏；
     ② `TREND_FALSE_ZERO`：`false_zero_snapshot` 判为假零（0 样本而历史已有非 0 点）。
+    写盘之后才分出的两种（#63 验收 4：样本数下降不静默）：
+    ③ `TREND_APPENDED_DECLINE`——已落盘，但本场 `sampleSize` 低于趋势里最新一条；
+    ④ 否则 `TREND_APPENDED`。
     咽喉放在这里，所有写趋势的入口（会话收尾 `record_session_snapshot` 与 eval --trend 的
     `persist_eval_output`）共用同一份判据，不再有第二处各写一份的余地。
-    需要 bool 语义的调用方写 `status == TREND_APPENDED`。"""
+    「写没写盘」只问 `is_appended(status)`（③④ 都算写了），别写 `== TREND_APPENDED`。"""
     p = Path(path)
     trend = load_trend(p)
     if trend and _content_key(trend[-1]) == _content_key(snapshot):
         return TREND_DUPLICATE
     if false_zero_snapshot(trend, snapshot):
         return TREND_FALSE_ZERO
+    declined = sample_declined(snapshot, trend)
     p.parent.mkdir(parents=True, exist_ok=True)
     with open(p, "a", encoding="utf-8") as f:
         f.write(json.dumps(snapshot, ensure_ascii=False) + "\n")
-    return TREND_APPENDED
+    return TREND_APPENDED_DECLINE if declined else TREND_APPENDED
 
 
 def _delta(current, ref):
@@ -147,7 +194,13 @@ _METRIC_ROWS = (("样本", "sampleSize", "{:+d}"), ("回复", "repliedCount", "{
 
 def render_trend_table(current, trend):
     """eval --trend 的终端对比表格（拍板 Q2）：baseline / previous / current 及变化幅度。
-    冷启动只有 current 一列（baseline 记录于本条）。"""
+    **契约：`trend` 是不含 `current` 的历史**（调用方须在快照 append **之前**读它，#82）——
+    `previous` 取 `trend[-1]`，写后读会让它等于 `current` 自己，Δprev 恒 +0 就成了自比。
+    本函数不按 ts 剔除「看着像 current 的末条」：duplicate 场景下末条与 current 同内容却确实是
+    上一条，剔除只会让读数更错（判定只留 `append_trend` 咽喉那一份）。
+    冷启动（`trend` 为空）表格照打 baseline / previous 两列（值都是 `—`），只是不出 Δprev/Δbase
+    两列，末尾附一行「(baseline 记录于本条——下次评估起展示对比)」提示；只写 current 一行的
+    是 `render_trend_md`。"""
     baseline = trend[0] if trend else None
     previous = trend[-1] if trend else None
     ts_col = lambda entry: f"({entry.get('ts', '')[:10]})" if entry else ""  # noqa: E731
@@ -185,6 +238,10 @@ def render_trend_table(current, trend):
 
 def render_trend_md(current, trend):
     """趋势 → `## EDD 趋势跟踪` Markdown 块（投递会话汇报直显 / eval --trend 复用）。
+    **契约：`trend` 是不含 `current` 的历史**（调用方须在快照 append **之前**读它，#82）——
+    「vs 上次」取 `trend[-1]`，写后读会让它等于 `current` 自己，增量恒 +0、ts 打的本场 ts。
+    本函数不按 ts 剔除「看着像 current 的末条」：duplicate 场景下末条与 current 同内容却确实是
+    上一条，剔除只会让读数更错（判定只留 `append_trend` 咽喉那一份）。
     sufficient 与观测解耦：样本不足也输出，含距达标缺口（拍板 Q7 示例口径：
     「当前样本 22/30 (73.3%)，回复 1/22 (4.5%)，距离有效推断还需 8 条配对」）。"""
     lines = ["## EDD 趋势跟踪"]

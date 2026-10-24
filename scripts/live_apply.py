@@ -5,8 +5,8 @@
 - 导航从搜索列表点击卡片进入（真实浏览轨迹），卡片缺失才回退直跳并计数
 - 招呼语不预写：会话中 agent 读 request_N.json 起草，写 reply_N.json 后脚本发送前
   机械核验三道 gate + level（pre_send_gate，违规拦截不发送——确定性不靠 agent 自评）
-- 双轨录像（private/data/videos/<ts>/）：全程 webm（context.close 后落盘）+ 动作截图 shots/
-- 结束不关窗：轮询 CLOSE 哨兵文件，收到信号（或 Ctrl+C）后退出，视频自动落盘
+- 动作截图 shots/：逐岗截图落在会话目录 shots/ 下（#105：全程 webm 录像与自动剪辑已下线）
+- 结束不关窗：[done] 后轮询 CLOSE 哨兵（Ctrl+C 亦可）退出，浏览器窗口保持打开（#39）
 - 单路径投递（用户约定 2026-09-10）：旧流水线（crawl_jds.py + batch_apply_v2.py）已从
   流程移除并随 #44 物理清理，本脚本是唯一投递入口；节奏/限速共用品在 _limits.py
 """
@@ -76,6 +76,7 @@ from _profile_paths import (  # noqa: E402  #28：私有路径唯一出口（废
 )
 from _atomic_io import write_json_atomic
 import _edd  # #37 EDD 趋势观测：会话收尾快照的渲染层
+import _followup_shape as fshape  # noqa: E402  #63 切片 B：会话清单签名与否决判据（两个 writer 共用）
 import _inbound_watermark as wm  # noqa: E402  #75 条目 B：收尾采集的报告也带水位线两键（只读、不推进）
 import _issue_reporter  # #51 熔断/停批事件建票（HITL 提示 + AUTOJOB_AUTO_ISSUE=1 自动）
 import _logging  # #38 机读日志旁路：print 人读层不动，事件旁路落 JSONL（双轨制）
@@ -183,9 +184,11 @@ import gen_greetings as g  # 发送前机械 gate：三道扫描与起草 gate �
 # _profile_paths.resolve_kb_profile（#29 P1 收敛点）
 PROFILES = ROOT / "private/kb/profiles"  # 共享目录：行业 profile 注册（#28 不隔离）
 SESSION_BASE = ROOT / "private/data/live_session"  # legacy 默认；run_live 按解析前缀重算
-VIDEO_BASE = ROOT / "private/data/videos"
 CLOSE_SENTINEL = "CLOSE"
 SKIP = "__SKIP__"  # reply_N.json 写 {"skip": true} → agent 判定岗位不匹配，立即跳过不投
+# #93 C：来历哨兵——reply 有内容但 mtime 早于本岗 request，说明它是上一岗（撞号）留下的残留。
+# 只在校验内部用，绝不外泄给调用方（wait_reply 的返回值形状不变：send_text / SKIP / None）。
+_STALE_REPLY = "__STALE_REPLY__"
 # 起草窗口默认值（2026-10-20 由 1200 收到 420）：502 对可用 request/reply mtime 里 p90 174s、
 # p95 258s，>600s 仅 7 条且全是「没人盯队列」而不是起草慢——1200 档下这种场次每岗烧 20 分钟才
 # 暴露。旧档 1200 的理由是 2026-09-25「事后补 reply 无效」，那条已被 #55 的宽限复查修掉，
@@ -599,6 +602,44 @@ def _read_reply_text(path):
         return None  # 写一半的 JSON：继续等
 
 
+def _request_freshness_floor(session_dir, idx):
+    """本岗草稿的新鲜度下限＝request_{idx}.json 的落盘时刻（#93 C）。
+    协议里 agent 只可能在看到本岗请求**之后**写 reply，所以早于它的 reply 必然不是本岗写的。
+    真机现场 private/data/live_session/20261022-135127/report.json 里 idx=1 有两条（补投轮
+    投出 + 推荐轮落空），那场没发错是因为第二条 `no_jd` 压根没走到取草稿——守卫拦的是这个
+    形状，不是那一场的运气。
+    入场取一次、不逐拍重取：request 写完就不再动，每拍多一次 stat 只是开销，还会在
+    「后续岗位覆写同名 request」时把下限推后、让守卫看着像在生效。
+    request 不存在返回 None＝守卫失效不改判（只写 reply 的调用方与老会话目录退回纯内容口径）。
+    投递轮与入站回复（`reply_inbound.reply_one` 先写 request 再调 `wait_reply`）共用这一道关。"""
+    try:
+        return (Path(session_dir) / f"request_{idx}.json").stat().st_mtime
+    except OSError:
+        return None
+
+
+def _read_fresh_reply_text(path, floor):
+    """轮询一拍的内容判定（#93 C）：在 `_read_reply_text` 之外加一道来历核验——
+    有内容但 mtime 早于本岗 request 的，返回 _STALE_REPLY 哨兵（与 None「还没写好」分开，
+    陈旧播报才只对来历不对的那份说）。floor=None（无 request）时守卫失效，照旧按内容判定。"""
+    text = _read_reply_text(path)
+    if text is None or floor is None:
+        return text
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        return None  # 刚被换掉的瞬间读不到：照旧继续等
+    return _STALE_REPLY if mtime < floor else text
+
+
+def _warn_stale_draft(reported):
+    """陈旧草稿的播报（#93 C）：同一份陈旧文件会被读到每一拍，一次等待只报第一行
+    （刷屏的警告等于没有警告）。返回新的「已报」标记——主轮询与宽限复查共用一条报线。"""
+    if not reported:
+        print("    [队列] reply 早于本岗 request——判为上一岗残留的陈旧草稿，继续等本岗起草")
+    return True
+
+
 def wait_reply(
     session_dir,
     idx,
@@ -614,13 +655,19 @@ def wait_reply(
     损坏/空白文件（agent 写一半）不判定，继续轮询到超时。
     超时后不立即翻篇（#55 部分一）：再宽限复查 grace 秒（每 grace_poll 秒查一次）——
     迟到草稿在窗口内送达即正常消费（调用方无感，日志标「救回」）；窗口过仍无 →
-    「已作废」。背景：2026-09-26 实测晚 94s 送达的 reply 被静默丢弃；grace=0 退回旧语义。"""
+    「已作废」。背景：2026-09-26 实测晚 94s 送达的 reply 被静默丢弃；grace=0 退回旧语义。
+    来历核验（#93 C）：早于本岗 request 落盘时刻的 reply 是上一岗残留，判陈旧后继续等——
+    主轮询与宽限复查两阶段同一道关，SKIP 哨兵也不例外（否则上一岗的 skip 会替本岗跳岗）。"""
     path = Path(session_dir) / f"reply_{idx}.json"
+    floor = _request_freshness_floor(session_dir, idx)
+    stale_reported = False
     t0 = now_fn()
     while now_fn() - t0 < timeout:
         _touch_heartbeat(f"wait_reply:{idx}")  # agent 起草等待是合法长停，逐拍豁免误杀
-        got = _read_reply_text(path)
-        if got is not None:
+        got = _read_fresh_reply_text(path, floor)
+        if got is _STALE_REPLY:
+            stale_reported = _warn_stale_draft(stale_reported)
+        elif got is not None:
             if got == SKIP:
                 print("    [队列] agent 判定岗位不匹配，跳过")
             else:
@@ -631,8 +678,10 @@ def wait_reply(
     t1 = now_fn()
     while now_fn() - t1 < grace:
         _touch_heartbeat(f"wait_reply:{idx}")  # 宽限复查同样逐拍
-        got = _read_reply_text(path)
-        if got is not None:
+        got = _read_fresh_reply_text(path, floor)
+        if got is _STALE_REPLY:
+            stale_reported = _warn_stale_draft(stale_reported)
+        elif got is not None:
             print("    [宽限] 迟到草稿在宽限窗口内送达——已被救回，岗位正常处理")
             if got == SKIP:
                 print("    [队列] agent 判定岗位不匹配，跳过")
@@ -769,7 +818,7 @@ def classify_reason(reason):
 def wait_close_sentinel(sentinel_path, poll=5, sleep_fn=time.sleep):
     """轮询 CLOSE 哨兵文件；出现即返回。Ctrl+C 由上层捕获（KeyboardInterrupt 同样退出）。"""
     sentinel = Path(sentinel_path)
-    print(f"[保持] 浏览器保持打开；写 {sentinel} 结束会话并保存视频（Ctrl+C 亦可）")
+    print(f"[保持] 浏览器保持打开；写 {sentinel} 结束保持（Ctrl+C 亦可）")
     while not sentinel.exists():
         sleep_fn(poll)
     print("[保持] 收到 CLOSE 信号")
@@ -948,6 +997,71 @@ def find_comm_button_with_recovery(page, eid, job_name=None, beat_fn=None):
         print("    [导航] 未在目标岗详情（起草期间被弹回 / 卡片未进详情），直跳独立详情页重试")
     open_standalone_detail(page, eid)
     return find_comm_button(page, beat_fn=beat)
+
+
+def _jd_body_present(jd_text):
+    """「这一次抓到 JD 正文了吗」的唯一口径（#67 抽成一处）。`grab_detail` 的返回契约是 str，
+    空白串与越契约的非字符串都不算正文——#56 修复轮 3 R2 的「只有拿到非空字符串正文才产
+    request_N.json」与 #67 的「落空才考虑重进」必须问同一个答案，两处各写一遍就会分叉。"""
+    return isinstance(jd_text, str) and bool(jd_text.strip())
+
+
+def grab_detail_with_reentry(page, eid, job_name, detail_data, beat_fn=None):
+    """JD 落空且**此刻不在本岗详情** ⇒ 本场重进本岗详情一次再抓；返回 `(jd_text, reentered)`。
+
+    为什么要重进（#67，现场＝场次 20261020-153733）：那场的三条读数合起来是
+    `detail_no_response` + `zero_hits` + 落空时刻 URL 是列表页 `/web/geek/jobs`——按 #56 A5 的
+    分流那是**「人已离岗被弹回列表」**那一支，不是「岗位没有 JD」。旧实现这里 `grab_detail`
+    只跑一次就落 `no_jd`，于是这种可救的岗最早也要到**下一场**的补投轮才有第二次机会
+    （那时登录态/关键词/排名都变了）。
+
+    三条拍板约束（2026-10-22 复 triage，逐条对应实现）：
+    - **① 判据形态无关**：触发写作 `not on_job_detail(page, eid, job_name)`，**不拿「URL 不含
+      job_detail」当判据**——分栏视图 `/web/geek/jobs?query=…` 的 URL 本来就不含 job_detail，
+      在该形态上这么判「被弹回」恒真，重进会把右栏连同「立即沟通」按钮一起毁掉（#41 第八轮据此
+      改判右栏，见 `JOB_PANEL_TITLE_SELECTORS` 上方那段）。此刻确实在本岗详情（两种形态任一）
+      ⇒ **什么都不做，零额外导航**。
+    - **② 通道复用**：走 #41 第八轮收敛后的兜底 `open_standalone_detail` 直跳 `/job_detail/{eid}.html`。
+      票面原文的「点卡片优先」按 #41 现行裁决作废（卡片点击被吸顶筛选栏拦截 8s 超时，点中后
+      又渲染回分栏视图，兜底效果不稳定）。
+    - **③ 封顶 1 次/岗**：只重进这一次，第二次仍落空不再重进、绝不循环（#41 的成环教训）。
+
+    拍板 ③ / #56 A3 契约：本函数里**三处**都可能停在无超时的协议调用上，逐处接同一个 `beat_fn`
+    前后各拍一点——① 判据 `on_job_detail` 在分栏视图下要经 `job_panel_title` 读右栏标题
+    （那是一次无超时 `page.evaluate`，`scripts/_no_jd.py` 明记这类站点正在由 #56 治、新增要接拍点）；
+    ② `open_standalone_detail` 里那句 `page.goto`；③ 第二次 `grab_detail` 的两段轮询自带 `jd:*` 拍点。
+    于是楔死时只剩的最后一条 label 能指认停在「判形态」还是「重进导航」还是「第二次轮询」——
+    判据那一步若不拍点，落空时最后一条只会是首抓的 `jd:dom-probe:post`，把「判形态时挂住」
+    误读成「停在第二次轮询」。本函数不绕过阶段 2 已跑过的 `detect_risk_signal` 与 `_skip_job`
+    的 pacer（重进自带的 2–4s 停顿在 `open_standalone_detail` 里）。
+
+    **残留不算救回**（诚实性）：第二次导航若没有**新的** detail.json 回来，容器 `data` 仍是首抓
+    读过并判空的那份，`grab_detail` 的 XHR 空等一看到它非 None 就立刻收工。结构上这不可能是救回：
+    首抓若能从这份 `data` 取出正文，就会在第一次返回、根本不会重进（`grab_detail` 与
+    `classify_no_jd` 共用 `detail_post_description` 这一条取值链）——所以第二次拿到正文只可能来自
+    新响应或重进后新渲染的 DOM，不会是首抓的残留。
+
+    `grab_detail` 的返回契约（str）一字未动，本函数原样透传；失败语义仍归调用方
+    （落空照旧 `no_jd`，只是归因与读数反映最后一次尝试）。"""
+    beat = beat_fn or _noop_beat
+    jd_text = grab_detail(page, detail_data, beat_fn=beat)
+    if _jd_body_present(jd_text):
+        return jd_text, False
+    # 判形态这一步自己就是一次无超时协议调用（`job_panel_title` 的 evaluate），照样接拍点。
+    beat("detail:panel-title:pre")
+    on_detail = on_job_detail(page, eid, job_name)
+    beat("detail:panel-title:post")
+    if on_detail:
+        return jd_text, False
+    try:
+        url = str(getattr(page, "url", "") or "")[:120]
+    except Exception:  # noqa: BLE001  # 页面已关时 url 属性本身就抛（同 _log_detail_empty 的口径）
+        url = ""
+    print(f"    [重进] JD 落空且此刻不在本岗详情（URL={url}），本场重进详情一次再抓")
+    beat("detail:reenter-goto:pre")
+    open_standalone_detail(page, eid)
+    beat("detail:reenter-goto:post")
+    return grab_detail(page, detail_data, beat_fn=beat), True
 
 
 # --- #62：站点「对搜索结果是否满意？」反馈浮层的识别（纵深防御的第一层）-------------
@@ -1751,6 +1865,9 @@ def _acquire_and_draft_greeting(flow):
     #56 A5②：grab_detail 返回空串时按容器证据给本岗归因（三类之一，`classify_no_jd`），
     结果条目带 `jd_class`、终端打印按类说话（人读层措辞前缀不变），并落一条
     `detail_empty_outcome` 事件——台账口径不再默认「岗位疑已失效」。
+    #94 验收 5：同一个出口再存一份页面现场（`live-no-jd-{idx}` 三件套）——机读事件答不出
+    「落空那一刻屏上有什么」，而切片 A-1 钉住的那组选择器一旦与页面形态脱节，只有现场 HTML
+    能事后复核读数。
     #56 修复轮 F1：结果条目再带两条分流读数 `dom_shape` / `detail_code`（类别与台账政策都不变），
     「往返没回/挂起」与「详情页落空」在终端、事件与 report 三处都读得出来。
     #56 修复轮 4/E：`dom_shape=zero_hits` 的措辞回到两假说并列（形态漂移 / 人已离岗弹回列表，
@@ -1760,15 +1877,37 @@ def _acquire_and_draft_greeting(flow):
     request_N.json**，且产出的 `jdText` 恒非空——拿不到正文（含平台层返回空白串或非字符串这类
     越契约形态）一律走 no_jd，绝不让 agent 对着一份没有 JD 正文的请求写招呼语。
     判「有没有正文」的正主是 `platforms/chat_first.py::detail_post_description`（`grab_detail` 与
-    `classify_no_jd` 共用同一条链），这里的守卫只兜「返回值越了契约」这一种分叉。"""
+    `classify_no_jd` 共用同一条链），这里的守卫（`_jd_body_present`）只兜「返回值越了契约」这一种分叉。
+    #67：**首抓落空且此刻不在本岗详情时，本场重进详情一次再抓**（1 次/岗封顶、判据形态无关，见
+    `grab_detail_with_reentry`）；**落空的那条 `no_jd` 结果条目**因此带 `reentered` / `jd_chars`
+    两键（救回的岗已转成 `applied` 条目、不带这两键，它的计数只在 report 的 `no_jd_reentries` 里
+    读得到——逐岗认「哪个岗是被捞回来的」要靠 no_jd 条目那一侧）。归因与补投
+    口径**不因重进而改变**（拍板 ⑤）：`jd_class` / `dom_shape` / `empty_url` 反映的是**最后一次**
+    尝试留下的容器证据，所以「重进后仍 `detail_no_response` 且已在详情页」照旧走 #56 的往返失败 /
+    IP 支（保留补投），「重进后 code=0 而两侧无正文」照旧是 `dom_xhr_both_empty`（移出补投）。"""
     page, job, idx, ctx = flow.page, flow.job, flow.idx, flow.ctx
     # #56 A3：grab_detail 的 DOM 轮询（page.evaluate，timeout=None）与 XHR 空等循环是同族
     # 无超时站点，拍点接进心跳后，「死在轮询第几轮」也读得出来（返回契约未动）。
-    jd_text = grab_detail(page, flow.detail, beat_fn=_heartbeat_beat)
-    if not (isinstance(jd_text, str) and jd_text.strip()):
+    # #67：落空且不在本岗详情 ⇒ 重进一次再抓（通道复用 #41 的直跳兜底）。
+    jd_text, reentered = grab_detail_with_reentry(
+        page, job.get("encryptJobId"), job.get("jobName"), flow.detail, beat_fn=_heartbeat_beat
+    )
+    jd_chars = len(jd_text.strip()) if _jd_body_present(jd_text) else 0
+    _record_no_jd_reentry(ctx, reentered, jd_chars)
+    if reentered and jd_chars:
+        print(f"    [重进] 重进后拿到 JD 正文 {jd_chars} 字（本岗救回，不落 no_jd）")
+    if not _jd_body_present(jd_text):
         jd_class = classify_no_jd(flow.detail)
         signals = _no_jd_signal_readings(flow.detail)  # 修复轮 F1：两条分流读数同源再算一次
         _log_detail_empty(page, flow, jd_class)  # #56 A5①：把静默面变成可观测
+        # #94 验收 5（观测补一格）：落空时也存一份页面现场（PNG + 完整 HTML + url.txt）。
+        # 机读事件答的是「哪条读数落在哪个岗」，答不出「那一刻屏上到底有什么」——场次
+        # 20261022-135127 那个岗的矛盾（`dom_shape=zero_hits` vs 右栏职位描述清晰在屏）当时只被
+        # 同一时刻的 after-read 截图人眼看出，crash 目录里没有可回读的 HTML。三件套本体与
+        # 逐件如实播报由 #43/#53 修好，这里只把触发点扩到 no_jd；`save_crash_evidence` 的
+        # 每一层各自吞异常（外层连 `mkdir` 失败也兜住），所以与同文件其余落空路径一样裸调，
+        # 不额外包 try——本岗处置仍由下面的 `_skip_job` 决定。
+        ctx.platform.save_evidence(page, f"live-no-jd-{idx}", job)
         # 落空现场当场念出来：它是票面「若 no_jd 不降则独立开票」的判据，等回读 report 太晚。
         # 修复轮 4/E：措辞从断言式改成两假说并列——零命中不是「形态漂移」的单义证据（分栏视图
         # URL 不含 job_detail，人已离岗被弹回列表同形，见 `no_jd_dom_shape`），分辨靠结果条目的
@@ -1779,7 +1918,7 @@ def _acquire_and_draft_greeting(flow):
             else ""
         )
         print(f"  [跳过] 没拿到 JD 全文（{_no_jd_class_label(jd_class)}{drift}）")
-        return _skip_job(flow, "no_jd", jd_class=jd_class, **signals)
+        return _skip_job(flow, "no_jd", jd_class=jd_class, reentered=reentered, jd_chars=jd_chars, **signals)
     flow.recruiter_active = _extract_recruiter_active(flow.detail)  # grab_detail 成功 ⇒ detail 响应已就位
     request_greeting(ctx.session_dir, idx, job, jd_text, recruiter_active=flow.recruiter_active)
     shot(page, ctx.shots_dir, f"request-{idx}")
@@ -2170,7 +2309,7 @@ def apply_live(page, job, session_dir, idx, shots_dir, cfg, pacer, platform, res
 # ---------------------------------------------------------------------------
 # 会话主循环（run_live）拆分：启动段 → 轮次段 → 报告段 → 收尾段。
 # 原来 188 行的一条直线里混着「路径解析 / 配置组装 / 门禁预检 / 轮次循环 / 报告落盘 /
-# 录像收尾」，任一段出问题都得读完全文；现在每段一个函数，段间只传 _LiveRun。
+# 收尾等待」，任一段出问题都得读完全文；现在每段一个函数，段间只传 _LiveRun。
 # ---------------------------------------------------------------------------
 
 
@@ -2183,10 +2322,8 @@ class _LiveRun:
     ts: str
     reported_path: Path  # #51：防重台账 private/data/[<profile>.]reported_issues.json
     browser_dir: Path
-    video_base: Path
-    video_kwargs: dict
+    video_base: Path  # 历史 videos/ 目录根：收尾 sweep_expired_data 仍按它清超期（#105 录像停产后清理通道保留）
     queries: list
-    record: bool
     limit: int
     applied_ids: set
     excluded: set
@@ -2197,20 +2334,13 @@ class _LiveRun:
     collected: list = field(default_factory=list)
 
 
-def _open_session_dirs(session_base, video_base, record, ts):
-    """建会话目录 / 截图目录 / （可选）录像目录，返回 (session_dir, shots_dir, video_kwargs)。
-    录像目录必须先存在——Camoufox 的 record_video_dir 只收已存在目录，且 ts 与会话目录对齐，
-    收尾段才能按同一 ts 找回落盘视频。"""
+def _open_session_dirs(session_base, ts):
+    """建会话目录 / 截图目录，返回 (session_dir, shots_dir)。"""
     session_dir = session_base / ts
     session_dir.mkdir(parents=True, exist_ok=True)
     shots_dir = session_dir / "shots"
     shots_dir.mkdir(parents=True, exist_ok=True)
-    video_kwargs = {}
-    if record:
-        vid_dir = video_base / ts
-        vid_dir.mkdir(parents=True, exist_ok=True)
-        video_kwargs = {"record_video_dir": str(vid_dir), "record_video_size": {"width": 1280, "height": 720}}
-    return session_dir, shots_dir, video_kwargs
+    return session_dir, shots_dir
 
 
 def _limit_desc(cfg):
@@ -2242,9 +2372,10 @@ def _apply_collect_cfg(cfg, env):
     上限」；旧的 LIVE_RECOMMEND_PER_ROUND 作为别名继续接受（只有它被设置时才生效并打印
     提示），避免既有环境变量静默失效。非法值回退默认并提示——一个写错的配置不该中断
     整场会话。"""
-    # 取值表口径与 `LIVE_RECORD` **同族**（同一张 `BOOL_ENV_EXACT_OFF`）；几张表的逐行对照只有
-    # 一份真源，见 `_limits.py` 的「布尔 env 开关」小节（#59 修复轮 R4-4：副本改成指针）；
-    # 此处只换解析入口，语义一字未动。
+    # 取值表是**精确串族**（`BOOL_ENV_EXACT_OFF`：不 strip 不 lower，关只认字面 "off"）；
+    # 几张表的逐行对照只有一份真源，见 `_limits.py` 的「布尔 env 开关」小节
+    # （#59 修复轮 R4-4：副本改成指针）；行为钉在
+    # `test_three_bool_env_switches_have_three_distinct_value_tables`。
     cfg["live_recommend"] = env_bool_switch(env, "LIVE_RECOMMEND", off_values=BOOL_ENV_EXACT_OFF)
     legacy = (env.get("LIVE_RECOMMEND_PER_ROUND") or "").strip()
     raw = (env.get("LIVE_COLLECT_CAP") or legacy).strip()
@@ -2332,12 +2463,6 @@ def _init_live_session(env):
     if cfg["profile_sections"] is None:
         print("[warn] profile_background 不可用（缺失或无编号小节）——备注 §存在性核验跳过，备注非空仍强制")
     queries = parse_queries(env)
-    # #57 第二轮收口（票面「同批登记」第 1 条）：解析走 `_limits.env_bool_switch`，参数逐项就是
-    # 接线前的口径——精确串比较（`BOOL_ENV_EXACT_OFF`）、非法值不提示。**取值表常量与几张表的逐行
-    # 对照只有一份真源**，在 `_limits.py` 的「布尔 env 开关」小节（#59 修复轮 R4-4：原先散在
-    # ≥6 处的副本改成指针，两处各维护必然漂），按行为钉住的用例是
-    # `test_three_bool_env_switches_have_three_distinct_value_tables`。
-    record = env_bool_switch(env, "LIVE_RECORD", off_values=BOOL_ENV_EXACT_OFF)
     dry_run = env.get("LIVE_DRY_RUN", "") == "1"  # #40 冒烟：到发送前 gate 截停
     cfg["dry_run"] = dry_run
 
@@ -2348,7 +2473,7 @@ def _init_live_session(env):
     startup_jitter(cfg)
 
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-    session_dir, shots_dir, video_kwargs = _open_session_dirs(session_base, video_base, record, ts)
+    session_dir, shots_dir = _open_session_dirs(session_base, ts)
     # 两条呈报各管一件事、刻意不合并（#56 B1）：这条答「刚死了一场」，下一条答
     # 「从此不再碰哪些岗、凭什么、代价是什么」。
     _surface_prior_wedge(session_base, ts)
@@ -2429,9 +2554,7 @@ def _init_live_session(env):
         reported_path=reported_path,
         browser_dir=browser_dir,
         video_base=video_base,
-        video_kwargs=video_kwargs,
         queries=queries,
-        record=record,
         limit=limit,
         applied_ids=applied_ids,
         excluded=excluded,
@@ -3450,8 +3573,8 @@ def _span_end(session, source, query, start, idx):
     build_report 多一个「看着能归属」的假区间。
 
     跨度除编号区间外还带 res_from/res_to（results 列表的切片区间），原因见 _result_source：
-    跨会话补投轮与搜索流的编号是两个各自从 1 起的区间，只看 idx 会把「台账里那一封」读成
-    「搜索里那一封」。"""
+    编号区间在 #93 A 之前会跨轮重叠（只看 idx 会把「台账里那一封」读成「搜索里那一封」），
+    A 之后不再重叠，切片作为不依赖编号唯一的第二重保障保留。"""
     res_from, idx_from = start
     if idx < idx_from:
         return
@@ -3472,13 +3595,15 @@ def _execute_query_rounds(page, run):
     「搜索 → 列表拟人浏览 → 逐岗投递」，直到停批信号。推荐流轮在前（#61 方案 A）。
     三级异常边界在此收敛：关键词级在 keyword_round 内记账后跳过，推荐流级在
     _recommend_round 内记账后跳过，单岗级在 _apply_one_job 内存证后跳过——任何一岗、
-    一个关键词或推荐流的一轮异常都不得终结整场会话。"""
+    一个关键词或推荐流的一轮异常都不得终结整场会话。
+    起号统一从 state["last_idx"] 取（#93 A）——两个补投轮与搜索/推荐轮共用这处续号，本场
+    request_N/reply_N 因此一号一岗；从 0 起会把上一岗已发出的草稿文件当成本岗草稿消费掉。"""
     session = run.session
     if not _preflight_guarded(page, session):
         notify("Live 投递未启动", "起飞前自检：点击通道不可用（列表卡片点击超时），本次未投递")
         return
     cap = session.cfg.get("collect_cap")
-    idx = 0
+    idx = session.state.get("last_idx", 0)  # #93 A：从本场已发到的号续起，补投轮用过的号不许被搜索流重发
     stop = False
     # #61 方案 A：推荐流前置——开轮挪到关键词轮之前，且开轮不再看停批信号（见
     # _recommend_turn_open）。票面实测：会话 20261005-215607 的 report.json 里
@@ -3513,7 +3638,7 @@ def _execute_query_rounds(page, run):
         span = _span_start(session, idx)
         stop, idx = _apply_fresh_jobs(page, run, fresh, idx)
         _span_end(session, "search", q, span, idx)  # #61 验收 2：每个关键词轮各落一条跨度
-    session.state["last_idx"] = idx  # #55：补投轮的 idx 从这里续号（request_N 不与主轮撞号）
+    session.state["last_idx"] = idx  # #55 + #93 A：本轮发到的号交回这处续号点，后续补投轮从这里接着发
 
 
 def _recommend_turn_open(run):
@@ -3605,7 +3730,7 @@ def _retry_pending_jobs(page, run):
     idx = session.state.get("last_idx", 0)
     # 跨度起点与 kept/stopped 同一行取（#61 验收 2）：起点必须在逐岗循环之前取，而本函数
     # 的语句数贴着 ruff 的 max-statements=50 门槛，单独占一行会顶破它。
-    # 台账轮的 idx 区间可与搜索流重叠（见 _result_source），靠 res 切片区分来源。
+    # #93 A 后本轮发的号与搜索流不重叠，但来源归因仍靠 res 切片（判据不依赖编号唯一，见 _result_source）。
     kept, stopped, span = [], False, _span_start(session, idx)
     for pos, entry in enumerate(entries):
         if is_excluded_company(entry.get("brandName"), run.excluded):
@@ -3722,13 +3847,13 @@ def _span_covers(span, position, idx):
 def _result_source(spans, position, idx):
     """一条 result 的来源（"search" | "recommend" | "retry" | None）——归不上就 None。
 
-    为什么要「编号 + 切片」两条判据同时核对，而不只看 idx：跨会话补投轮
-    （`_retry_pending_jobs`）从 state["last_idx"] 起号，而搜索流（`_execute_query_rounds`）
-    的 idx 从 0 起（既有语义，本次不动，#55 的续号只覆盖补投轮之间）——于是台账轮与搜索轮
-    的编号区间**都是 1..N、可以重叠**，只看 idx 会把台账里投出的那一封读成搜索流投出的。
-    results 列表的切片在同一场会话里严格递增，只有它能把两者分开。
-    命中多个来源时（正常会话到不了这一步，台账轮与搜索轮切片不重叠）也返回 None：
-    分不清就不写。"""
+    为什么要「编号 + 切片」两条判据同时核对，而不只看 idx：#93 A 之前跨会话补投轮
+    （`_retry_pending_jobs`）从 state["last_idx"] 起号、搜索流（`_execute_query_rounds`）
+    却从 0 起，两段的编号区间**都是 1..N、可以重叠**，只看 idx 会把台账里投出的那一封读成
+    搜索流投出的。A 之后一场会话**一号一岗、号段不再重叠**，但这条判据保留：
+    归属不依赖「编号唯一」这个前提，将来任何一处续号退化（或历史 report 回读）都还会
+    被切片挡住——判据比约定便宜，多一道不需要谁守约的保险。
+    命中多个来源时（正常会话到不了这一步）也返回 None：分不清就不写。"""
     hits = {span["source"] for span in spans if _span_covers(span, position, idx)}
     return hits.pop() if len(hits) == 1 else None
 
@@ -3778,6 +3903,43 @@ def _no_send_reason_stats(results):
             continue
         key = r.get("reason")
         stats[key if key in stats else "other"] += 1
+    return stats
+
+
+# #67：本场 no_jd 重进的三个计数（写点唯一，见 `_record_no_jd_reentry`）。
+_NO_JD_REENTER_KEYS = ("reentered", "recovered", "still_no_jd")
+
+
+def _record_no_jd_reentry(ctx, reentered, jd_chars):
+    """#67 聚合读数的**唯一写点**：三个计数各在一处 +1，不在谓词、消息或读数层重算一遍
+    （同一份数算三处就是 #82 那张票的成因）。没走过重进时不写这个键——`_no_jd_reentry_stats`
+    照旧按零形态落 report，所以「本场重进 0 次」是一条读数而不是缺键（拍板 ④）。
+    `reentered` = 走过重进的岗数（封顶 1 次/岗 ⇒ 与重进次数同一个数）；
+    `recovered` = 重进后拿到正文的岗数（＝票面要的「救回数」）；
+    `still_no_jd` = 重进后仍落空的岗数（这一支的归因照旧由 `jd_class` 说话，不许被救回率盖掉）。"""
+    if not reentered:
+        return
+    stats = ctx.state.setdefault("no_jd_reentries", dict.fromkeys(_NO_JD_REENTER_KEYS, 0))
+    stats["reentered"] += 1
+    if jd_chars:
+        stats["recovered"] += 1
+    else:
+        stats["still_no_jd"] += 1
+
+
+def _no_jd_reentry_stats(state):
+    """#67 验收 4 的 report 读数：把 `_record_no_jd_reentry` 落在 state 上的三个计数原样搬出来
+    （三键恒在，零重进的场次也打出 0——与 `_greeting_ledger_stats` 同一个「未接线给零形态而不是缺键」
+    的口径）。取值这里逐键判 int，不像兄弟函数整份 `update`：读侧要挡的是桩 state 与越形态的旧值，
+    越了就归 0、不猜（#47「未知新状态保守归 failed」同向）。
+    这里**不重算**也不从 results 反推：反推只能数出 `still_no_jd`（救回的岗已经不是 no_jd 条目），
+    救回数会读成 0——那正是「读数比条数」的旧毛病。"""
+    stats = dict.fromkeys(_NO_JD_REENTER_KEYS, 0)
+    recorded = state.get("no_jd_reentries")
+    if isinstance(recorded, dict):
+        for key in _NO_JD_REENTER_KEYS:
+            value = recorded.get(key)
+            stats[key] = value if isinstance(value, int) and not isinstance(value, bool) else 0
     return stats
 
 
@@ -3843,8 +4005,14 @@ def build_report(queries, state, results):
         # 非 0 返回码按类交叉（修复轮 4/B）：扁平总数读不出它属于哪一类、与哪个 no_jd 同容器
         "no_jd_code_nonzero_by_class": code_nonzero_by_class,
         # 落空时刻的 URL（修复轮 4/E）：zero_hits 两假说（形态漂移 / 人已离岗弹回列表）靠它
-        # 与 C 段栈人工分辨——url 含 job_detail 说明落空时还在某详情页，只是形态或岗位变了
+        # 与 C 段栈人工分辨——url 含 job_detail 说明落空时还在某详情页，只是形态或岗位变了。
+        # #67 之后它是**最后一次**尝试的 URL：走过重进的岗（逐岗看 `results[].reentered`）在这里
+        # 含 job_detail 只说明「重进到位了仍没拿到」，不能反过来读成「从没被弹回」。
         "no_jd_empty_urls": _no_jd_empty_urls(results),
+        # #67：本场「重进本岗详情再抓」的三个计数（reentered / recovered / still_no_jd，三键恒在，
+        # 零重进也打出 0）——no_jd 降了是因为可救的岗被救回（recovered），还是因为岗位真没内容
+        # （still_no_jd 的归因照旧看 no_jd_classes，重进读数不替它定性）。逐岗看 results[].reentered。
+        "no_jd_reentries": _no_jd_reentry_stats(state),
         # #47：跳过与失败分桶小计——reason_stats 只拆 agent_skip/no_jd 的细分原因，
         # 读者（agent 汇报给用户时）应按此口径播报，不得把 skipped 说成投递失败。
         "outcome_summary": outcome_summary(results),
@@ -3859,6 +4027,14 @@ def build_report(queries, state, results):
         # 复盘数据；#59 加了残缺这条路径），True = 收尾已采集最新会话——报告读者不必反推
         # eval 数据新旧。
         "followup_fresh": state.get("followup_fresh"),
+        # #63 切片 B：本场会话清单台账（六键恒在）——collected（本场采到）/ previous（上一份）/
+        # missing（上一份有本场没有）/ appeared（本场新增）/ shape（位置签名），外加切片 A 的
+        # `followupCollection` **原样嵌入**（读数要有单一出处，不逐字段复制）。
+        # dry-run 与采集失败这两种没有本场读数 ⇒ 各格落 `None` 不落 `0`（口径同 #61 的
+        # `source=null`、#65 的 `recommend_*=null`）；**判残缺不覆盖那一场是有读数的**——
+        # 落盘的报告是旧内容，而这三个数字正是「为什么被拒」的凭据，所以照样记（用例
+        # `test_collect_fresh_followup_stashes_ledger_even_when_it_vetoes` 钉的就是这一格）。
+        "followupLedger": state.get("followup_ledger") or fshape.build_ledger(),
         # #54：浏览器退出分类——None = 会话内未发生 browser-closed 类异常（正常会话
         # 零行为变化）；发生过则 {classification, detected_at, evidence}，读报告者不必
         # 再猜「浏览器为什么没了」。
@@ -3880,25 +4056,26 @@ def build_report(queries, state, results):
 
 
 def _followup_report_count(report):
-    """followup 报告的会话条数口径：conversations 列表长度优先，退化到 totalConversations。
-    #59 起现场采集与「上一份基准」共用这一条口径——两侧不同源的话，条数对比就不对齐。"""
-    convs = report.get("conversations")
-    n = len(convs) if isinstance(convs, list) else 0
-    return n or (report.get("totalConversations") or 0)
+    """followup 报告的会话条数口径。**实现只有 `_followup_shape.report_count` 一份**：
+    #59 起现场采集与「上一份基准」共用这条口径（两侧不同源，条数对比就不对齐），而 #63 切片 B
+    的否决比例腿也必须用它——判据与呈报各数一遍，就会在 `totalConversations` 是坏形态时给出
+    两个「上一份多少条」。这里保留名字给既有调用方与用例，函数体只做转发。"""
+    return fshape.report_count(report)
 
 
-def _prev_followup_count(path):
-    """上一份 followup 报告的会话条数（#59 残缺判定的基准）。
+def _prev_followup_report(path):
+    """上一份 followup 报告的**内容**（读不出 ⇒ `None`），#63 切片 B 起签名判据要看会话列表，
+    光一个条数不够——原 `_prev_followup_count` 的口径与异常语义一字不动地搬到这里：
 
-    只有两种情况归入「没有可比基准」（返回 0 ⇒ 本次照常落盘）：文件不存在，以及内容读得出
+    只有两种情况归入「没有可比基准」（返回 None ⇒ 本次照常落盘）：文件不存在，以及内容读得出
     却解不开（半写/坏 JSON，直接覆盖它才是恢复方向）。**其余异常（权限等）一律向上抛**——
     本函数无法判断基准时不许把「读不到」当成「没有基准」放行覆盖；调用方的外层 try 会把它
-    记成 `followup_fresh=False` + warn，宁可不覆盖。"""
+    记成 `followup_fresh=False` + warn，宁可不覆盖。顶层不是对象也归 None（形态读不出＝没基准）。"""
     try:
         data = json.loads(Path(path).read_text(encoding="utf-8"))
     except (FileNotFoundError, json.JSONDecodeError):
-        return 0
-    return _followup_report_count(data) if isinstance(data, dict) else 0
+        return None
+    return data if isinstance(data, dict) else None
 
 
 def _collect_fresh_followup(run, page):
@@ -3908,8 +4085,10 @@ def _collect_fresh_followup(run, page):
     一起 evaluate」由既有合并语义天然保证，无需额外拼接。
     护栏：任何失败只 warn + followup_fresh=False，不影响收尾报告与退出码（观测层语义，
     同 edd_wrapup）；dry-run 跳过（零副作用）；annotate（读回复原文分类）仍归 runbook
-    步骤 5 的 agent——本采集只供数，不替代标注。#59：采到条数不足上一份的一半同样判残缺
-    ——不覆盖、followup_fresh=False（0 条那条老防线保留原语义）。"""
+    步骤 5 的 agent——本采集只供数，不替代标注。
+    残缺判据（#59 立、#63 切片 B 收口）：0 条那条老防线原样保留；「不覆盖」的第二条腿从
+    #59 的纯比例（`n*2 < prev`）换成 `_followup_shape.decide` 的**两条腿**（形态 == 连续尾部
+    且跌幅过半），判据只有那一份出处，与 `followup_tracker.run` 调同一个函数。"""
     state = run.session.state
     if state.get("dry_run"):
         state["followup_fresh"] = None
@@ -3933,21 +4112,32 @@ def _collect_fresh_followup(run, page):
             print("[warn] 收尾 followup 采集到 0 条对话（疑似登录态过期/掉线）——沿用上次报告，不覆盖")
             return
         out = g.resolve_paths(env=run.env)["followup"]
-        prev = _prev_followup_count(out)
-        if prev > 0 and n_conv * 2 < prev:
-            # #59：护栏从「0 条才不覆盖」收紧为「与上一份条数对比」。首页截断的形态是**断崖**
-            # （20260929-202514 实测 3/100，随后 followup_tracker 同一函数拿到 100 条），
-            # 残缺但非零的报告过去照样覆盖全量，收尾 eval 于是算出 0 样本并追加进 eval_trend
-            # ——终端打出「样本 0/30、vs baseline −32」这种不存在的退化。阈值取「一半」而不是
-            # 草拟过的 max(0.5×prev, prev−10)：后者在 prev 大时等价于「几乎不许变少」（100→89
-            # 即拒），会把会话自然过期造成的真实衰减也判成残缺，从此长期停在旧报告上（新回复
-            # 永远进不了 eval），换一类失真；真实增减是 ±20% 级的渐进，一半这条线落在两者之间。
+        # #63 切片 B：位置签名分流。否决判据在 `_followup_shape.decide`（唯一一份，两个 writer 共用）。
+        # 这段排在 #75 的 `wm.attach_readings` **之前**是刻意的：水位线那两个恒在键属于「真正落盘的
+        # 那份报告」，先落键再否决等于把读数写进一份被丢弃的报告；attach 本身一字未动（只读、
+        # 绝不推进水位线），新增判据不改它那条链路。台账（`followupLedger` 的取数处）无论否决与否
+        # 都先落进 state——不覆盖那一场同样要能在 report.json 里读出「掉了几条、掉在哪」。
+        veto, reading = fshape.decide(_prev_followup_report(out), report)
+        ledger = fshape.build_ledger(reading, report.get("followupCollection"))
+        state["followup_ledger"] = ledger
+        # 读数本体也留一份给收尾 `[done]` 行：台账（`followupLedger`）是落盘形状，`phrase` 吃的是
+        # 签名读数——两份形态各拼一次措辞就又回到 #64/#75 的老事故，所以这里传对象不传字符串。
+        state["followup_shape"] = reading
+        if veto:
+            # #59 的断崖形态（20260929-202514 实测 3/100）：消失项构成上一份的**连续尾部**，
+            # 那是我们这侧的首页截断，不是站点侧移除。#63 把「跌幅过半」这一条腿收紧成两条腿：
+            # 散落形态（10-21 实测 63/84 消失、保留项散到第 83 位）不否决——否决它只会把全量覆盖写
+            # 的报告冻在旧名单上，新回复永远进不了 eval（比例阈值当初为什么画在「一半」而不是
+            # max(0.5×prev, prev−10)，全文记在 `_followup_shape` 模块头那一处，这里不抄第二遍）。
             state["followup_fresh"] = False
             print(
-                f"[warn] 收尾 followup 采集到 {n_conv} 条对话，不足上一份报告（{prev} 条）的一半"
-                "——判为残缺采集（首页截断形态），沿用上次报告不覆盖；收尾 eval 不吃这份残缺数据"
+                f"[warn] 收尾 followup 判为残缺采集——{fshape.phrase(reading)}——沿用上次报告不覆盖；收尾 eval 不吃这份残缺数据"
             )
             return
+        # 采集形态读数（切片 A）+ 本场签名一起落进 followup_report.json：这份报告是全量覆盖写的，
+        # 落在这里才谈得上「上一份的分母与签名」；趋势侧（`_edd.trend_snapshot(denominator=…)`）
+        # 也从这一个键取值，不在两个 writer 各拼一份措辞（#64/#75 的老事故）。
+        report["followupLedger"] = ledger
         # 水位线读数（#75 review 条目 B）：这条路径**整份重写**同一个 followup_report.json，
         # 两个恒在键必须在这里也落上——投递场次收尾正是用户读这份报告的时刻（「先看哪几条」问的是它）。
         # 与 followup_tracker / reply_inbound 走同一个 `attach_readings`，判据与措辞不各写一份。
@@ -3959,6 +4149,11 @@ def _collect_fresh_followup(run, page):
         # 已有自愈回落，这里不该再靠自己制造一次损坏。
         write_json_atomic(out, report)
         state["followup_fresh"] = True
+        if fshape.should_announce(reading):
+            # unknown（无历史基准）与散落/未过半的尾部形态都要念出来，不静默（票面验收 4）；
+            # stable 不打扰。措辞调 `_followup_shape.phrase`，本文件不再拼第二遍。
+            clause = "——照常覆盖，收尾 eval 吃这份数据" if reading["missing"] else ""
+            print(f"[清单签名] {fshape.phrase(reading)}{clause}")
         replied = sum(1 for c in report.get("conversations", []) if c.get("status") == "hr_replied")
         print(
             f"[followup] 现场采集 {n_conv} 条对话"
@@ -3976,8 +4171,27 @@ def edd_wrapup(paths, profile, now=None):
     故障绝不阻断投递收尾与退出码（投递结果落盘优先）。"""
     try:
         outcome = g.record_session_snapshot(paths, profile=profile, now=now)
-        if outcome.get("trend_appended"):
-            print(_edd.render_trend_md(outcome["snapshot"], _edd.load_trend(paths["trend"])))
+        # 两个问题各有一处答法：**写没写盘**只问 `_edd.is_appended(trend_status)`（唯一问法，
+        # `appended_decline` 也算写了；旧写法读 `trend_appended` 布尔，状态一多就会出现「同一件事
+        # 两个问法」，正是 #59 R4-5 收口掉的东西）；**渲染吃什么历史**由产生快照那一步交出
+        # （append **之前**那一份，#82），这里 pop 走只服务本次渲染、不进 report.json 的 `edd`
+        # 字段，渲染侧不自己 `load_trend`——写后读会让「vs 上次」比到本场自己。
+        history = outcome.pop("trend_history", None)
+        status = outcome.get("trend_status")
+        if _edd.is_appended(status):
+            if history is None:
+                # 缺历史形态（外部/降级 outcome 自称已追加）：宁可这块不渲染，也不回退到写后读那份去比
+                print("[EDD] 趋势块未渲染（收尾快照未带 append 前的趋势历史）")
+            else:
+                print(_edd.render_trend_md(outcome["snapshot"], history))
+            if status == _edd.TREND_APPENDED_DECLINE:
+                # 票面验收 4：样本数下降**不静默追加**——已经写盘了，但当场点名「这一条比最新一条少」。
+                # 判序在咽喉（`append_trend`）里，这里只念它给出的状态，不自己比 sampleSize。
+                size = (outcome.get("snapshot") or {}).get("sampleSize")
+                print(
+                    f"[EDD] 本场样本数低于趋势最新一条（本场 {size}）——快照照常落盘（不冻读数，#63 拍板），"
+                    "但这一条带着分母与签名，事后能分清「配对变少」与「会话清单变少」"
+                )
         else:
             # 无 followup / 空报告（登录过期 192616 实测）→ 快照未追加（防线在
             # record_session_snapshot 源头：空 conversations 不追加），仅不渲染趋势块；这两类在
@@ -4089,6 +4303,11 @@ def _write_session_report(run):
             parts.append("非 0 返回码（" + " / ".join(nz_parts) + "）")
         if parts:
             jd_desc += "；no_jd 分流 " + " / ".join(parts)
+    # #67：本场重进过几岗、救回几岗跟着 no_jd 分桶念一句（读数本体在 report.json 的
+    # `no_jd_reentries`，此处同源取数不重复计算）。0 时整段不出现（噪音口径同 wedge_desc）——
+    # 「本场一次都没重进」仍从 report.json 读得到那个 0，不靠终端缺行反推。
+    nre = report_data["no_jd_reentries"]
+    reenter_desc = f"；no_jd 本场重进 {nre['reentered']} 岗（救回 {nre['recovered']}）" if nre["reentered"] else ""
     # #56 B1：本场被台账跳过的岗数带一句（口径同 #47 的分桶播报，只读数不发明新展示层）；
     # 0 时整段不出现——正常会话零噪音，别把「一次都没撞上楔死岗」也刷成一行。
     wl = report_data["wedge_ledger"]
@@ -4107,38 +4326,36 @@ def _write_session_report(run):
         if gl.get(key)
     ]
     greet_desc = "；招呼语台账 " + " / ".join(greet_bits) if greet_bits else ""
+    # #63 切片 B：会话清单只在**签名不是 stable** 时才打扰收尾行（stable＝一条没掉，正常会话零噪音）；
+    # 措辞调 `_followup_shape.phrase`——这句话由两个 writer 与这里共享同一份，不许在 live_apply
+    # 再拼一遍（#64/#75 都栽在两个 writer 各写一份）。没有本场读数（dry-run / 采集失败）也不念，
+    # 报告里那一格是 None，终端不编话。
+    shape_reading = session.state.get("followup_shape") or {}
+    shape_desc = ("；" + fshape.phrase(shape_reading)) if fshape.should_announce(shape_reading) else ""
     print(
         f"\n[done] 投递 {session.state['applied']} 个（直跳回退 {session.state['direct_fallback']} 次），"
         f"未投 {summary['skipped']}（跳过/拦停），失败 {summary['failed']}，"
-        f"报告 {report}" + skip_desc + bx_desc + retry_desc + jd_desc + wedge_desc + greet_desc
+        f"报告 {report}"
+        + skip_desc
+        + bx_desc
+        + retry_desc
+        + jd_desc
+        + reenter_desc
+        + wedge_desc
+        + greet_desc
+        + shape_desc
     )
 
 
-def _hold_browser_until_closed(session):
-    """结束不关窗（#39）：通知后轮询 CLOSE 哨兵（Ctrl+C 亦可），退出后 Playwright 才落盘视频。"""
-    notify("Live 投递完成", f"投递 {session.state['applied']} 个；写 CLOSE 文件结束并保存视频")
+def _hold_browser_until_closed(run, poll=5, sleep_fn=time.sleep):
+    """结束不关窗（#39）：通知后轮询 CLOSE 哨兵（Ctrl+C 亦可）退出，浏览器窗口保持打开、
+    会话目录与 shots/ 照旧留盘（#105：录像/定格/保持段读数已随录像链路整体下线）。"""
+    applied = run.session.state["applied"]
+    notify("Live 投递完成", f"投递 {applied} 个；写 CLOSE 结束保持")
     try:
-        wait_close_sentinel(session.session_dir / CLOSE_SENTINEL)
+        wait_close_sentinel(run.session.session_dir / CLOSE_SENTINEL, poll=poll, sleep_fn=sleep_fn)
     except KeyboardInterrupt:
         print("\n[保持] Ctrl+C，直接退出")
-
-
-def _finalize_recording(run):
-    """收尾段（#39）：视频落盘清点 + 自动剪辑（按 shots/ 动作时刻剪掉长停留，用户约定
-    2026-09-10；ffmpeg 缺失则跳过）+ 截图路径提示。"""
-    if run.record:
-        vid_dir = run.video_base / run.ts
-        vids = sorted(vid_dir.rglob("*.webm"))
-        print(f"[录像] 视频已落盘 {len(vids)} 个 → {vid_dir}")
-        try:
-            subprocess.run(
-                [sys.executable, str(ROOT / "scripts/trim_live_video.py"), str(run.session.session_dir)],
-                check=True,
-                cwd=ROOT,
-            )
-        except Exception as e:
-            print(f"[录像] 自动剪辑跳过: {str(e)[:80]}")
-    print(f"[录像] 动作截图 → {run.session.shots_dir}")
 
 
 def _enable_line_buffering():
@@ -4173,7 +4390,6 @@ def run_live(env=None):
         headless=False,
         persistent_context=True,
         user_data_dir=run.browser_dir,
-        **run.video_kwargs,
     ) as context:
         page = context.new_page()
         _record_browser_pids(run.session)  # #54：启动期采集 Camoufox pid，供退出分类探活
@@ -4184,8 +4400,7 @@ def run_live(env=None):
         _collect_fresh_followup(run, page)  # #49：报告写盘前现场采集，收尾 eval 用最新数据
         _write_session_report(run)
         _mark_session_done(run.session)  # done 哨兵：看门狗退场，CLOSE 等待按用户节奏
-        _hold_browser_until_closed(run.session)
-    _finalize_recording(run)
+        _hold_browser_until_closed(run)  # 结束不关窗（#39）：等用户写 CLOSE / Ctrl+C
     return run.session.state["applied"]
 
 

@@ -19,6 +19,7 @@ mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(mod)
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _followup_shape as fs  # noqa: E402  #63 切片 B：签名/台账的键名与取值都按生产函数读，夹具不硬写
 import _inbound_watermark as wm  # noqa: E402  #75 水位线单一真源（接线用例直接走它的读/写入口）
 
 
@@ -803,3 +804,114 @@ def test_run_keeps_inbound_wording_for_small_batch(tmp_path, monkeypatch, capsys
     assert len(_inbound_rows(out)) == 2, out
     assert "[入站线索] 归不到投递记录 2 个，其中 2 个末条是对方发言" in out, out
     assert "其中有未读标记 0 / 无未读标记 2 / 读态未知 0" in out, out
+
+
+# --- #63 切片 B：这条独立链路（第二个 writer）也接上同一份残缺判据 ---
+
+
+def _prev_report_file(tmp_path, keys, prefix=""):
+    """上一份 `followup_report.json`（签名判定的基准）：按会话键 n 条，**新→旧**排（#63 实物结论），
+    于是「本场只剩前 k 条」＝连续尾部（首页截断），「跳着剩 k 条」＝散落（站点侧移除）。"""
+    path = tmp_path / "data" / f"{prefix}followup_report.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    convs = [_wm_conv(k) for k in keys]
+    path.write_text(json.dumps({"totalConversations": len(convs), "conversations": convs}), encoding="utf-8")
+    return path
+
+
+def test_run_does_not_overwrite_a_truncated_cliff(tmp_path, monkeypatch, capsys):
+    """连续尾部 + 跌幅过半（#59 的 3/100 形态）⇒ 不覆盖，warn 点名三个数字与签名。
+    这条链路此前**完全没有**残缺判据（#64 的教训：第二个 writer 同病却被漏掉）。"""
+    keys = [f"p{i}" for i in range(10)]
+    path = _prev_report_file(tmp_path, keys)
+    before = path.read_text(encoding="utf-8")
+    keep = keys[:3]
+    assert len(keep) * 2 < len(keys), "夹具须真的落在否决区（否则本条没在测判据）"
+    _patch_followup_run(monkeypatch, tmp_path, [_wm_conv(k) for k in keep])
+    mod.run()
+    assert path.read_text(encoding="utf-8") == before, "首页截断形态覆盖了全量报告"
+    term = capsys.readouterr().out
+    assert f"本场 {len(keep)} 条 / 上一份 {len(keys)} 条 / 消失 {len(keys) - len(keep)} 条" in term, term
+    assert "tail_truncated" in term and "[warn]" in term, term
+
+
+def test_run_veto_lands_a_durable_incomplete_event(tmp_path, monkeypatch):
+    """#63 双轴 review（Spec 轴第 5 条）：否决那一场本脚本**不写** followup_report.json，
+    「掉了几条、掉在哪」否则只活在终端一行 warn 里——单独跑这条链路的场次事后无处可查
+    （live_apply 侧不用补，它的 ledger 进会话 report.json）。补一条机读事件。
+    level 必须是 error：#48 实证过默认阈值是 ERROR，warning 级事件会被静默吞掉，
+    「写了」和「落盘了」是两件事——所以这条用例的存在本身就是那个新事件点的执行痕迹。"""
+    log = tmp_path / "app.log"
+    monkeypatch.setenv("AUTOJOB_LOG_PATH", str(log))
+    monkeypatch.delenv("AUTOJOB_STRUCTURED_LOG", raising=False)
+    monkeypatch.delenv("AUTOJOB_LOG_LEVEL", raising=False)
+    keys = [f"p{i}" for i in range(10)]
+    _prev_report_file(tmp_path, keys)
+    _patch_followup_run(monkeypatch, tmp_path, [_wm_conv(k) for k in keys[:3]])  # 前缀 3/10 ⇒ 连续尾部 + 跌幅过半
+    mod.run()
+    rows = [json.loads(x) for x in log.read_text(encoding="utf-8").splitlines() if x.strip()]
+    hits = [r for r in rows if r.get("event") == "followup_incomplete"]
+    assert len(hits) == 1, f"否决事件应恰好一条：{rows}"
+    assert hits[0]["level"] == "ERROR", hits[0]
+    assert hits[0]["shape"] == fs.SHAPE_TAIL_TRUNCATED, hits[0]
+    assert hits[0]["prevCount"] == 10 and hits[0]["newCount"] == 3 and hits[0]["missing"] == 7, hits[0]
+    assert hits[0]["out_path"].endswith("followup_report.json"), hits[0]
+
+
+def test_run_overwrites_scattered_loss_and_lands_the_ledger(tmp_path, monkeypatch, capsys):
+    """散落形态（10-21 实测的 63/84）跌幅同样过半，但那是**站点侧把人家的会话移走了**：
+    报告本来就该跟着变短 ⇒ 照常覆盖 + 把签名落进 `followupLedger`（趋势分母的唯一取数处）
+    + 终端点名不静默（票面验收 4）。"""
+    keys = [f"p{i}" for i in range(10)]
+    _prev_report_file(tmp_path, keys)
+    keep = keys[::2][:4]  # p0 p2 p4 p6 ⇒ 奇数位与尾部整段都缺，且保留项排在首个消失项之后
+    assert len(keep) * 2 < len(keys), "夹具须真的落在纯比例判据的否决区"
+    _patch_followup_run(monkeypatch, tmp_path, [_wm_conv(k) for k in keep])
+    mod.run()
+    data = _report_json(tmp_path)
+    assert [c["encryptJobId"] for c in data["conversations"]] == keep, "散落流失被当成残缺否决了"
+    ledger = data["followupLedger"]
+    assert ledger["shape"] == fs.SHAPE_SCATTERED_LOST, ledger
+    assert ledger["collected"] == len(keep) and ledger["previous"] == len(keys)
+    assert ledger["missing"] == len(keys) - len(keep) and ledger["appeared"] == 0, ledger
+    term = capsys.readouterr().out
+    assert f"[清单签名] 本场 {len(keep)} 条 / 上一份 {len(keys)} 条 / 消失 {ledger['missing']} 条" in term, term
+
+
+def test_run_prints_no_baseline_line_on_first_session(tmp_path, monkeypatch, capsys):
+    """上一份不存在（首跑）⇒ 覆盖，并打一行「无历史基准，本场只建立、不比对」；
+    不冒充成「一条没掉」（首跑不冒充，语义同 #75 的 `first_run`）。"""
+    _patch_followup_run(monkeypatch, tmp_path, [_wm_conv("p0"), _wm_conv("p1")])
+    mod.run()
+    term = capsys.readouterr().out
+    assert "无历史基准" in term and "不比对" in term, term
+    ledger = _report_json(tmp_path)["followupLedger"]
+    assert ledger["shape"] == fs.SHAPE_UNKNOWN, term
+    # 「没有上一份」在落盘形态里是 None，不是 0——0 会被下一个读者当成一条真实读数
+    # （双轴 review 查出的那一格：本仓 `null ≠ 0`，口径同 #61/#65）
+    assert ledger["previous"] is None, ledger
+    assert ledger["collected"] == 2 and ledger["missing"] == 0, ledger
+
+
+def test_run_stays_silent_when_the_list_matches_previous(tmp_path, monkeypatch, capsys):
+    """负对照（防把签名行改成「每场都念」）：与上一份一致 ⇒ 一行都不打扰，正常会话零噪音。"""
+    keys = [f"p{i}" for i in range(4)]
+    convs = [_wm_conv(k) for k in keys]
+    _patch_followup_run(monkeypatch, tmp_path, convs)
+    mod.run()  # 第一场：建立报告（念一次「无历史基准」）
+    assert "清单与上一份一致" not in capsys.readouterr().out
+    mod.run()  # 第二场：与上一份逐条相同 ⇒ 不再念
+    assert "[清单签名]" not in capsys.readouterr().out, capsys.readouterr().out
+    assert _report_json(tmp_path)["followupLedger"]["shape"] == fs.SHAPE_STABLE
+
+
+def test_both_followup_writers_share_one_veto_predicate():
+    """#64 的教训机械兜住：两条覆盖链路（`live_apply._collect_fresh_followup` 与
+    `followup_tracker.run`）都只调 `_followup_shape.decide`，比例腿 `* 2 <` 不许在 writer 里
+    出现第二遍——两处各抄一次，改一处就静默分叉（判据本体由 `test_followup_shape` 钉）。
+    源码钉的形态沿用 `test_run_live_collects_fresh_followup_before_report`。"""
+    for name in ("live_apply.py", "followup_tracker.py"):
+        src = (SCRIPTS / name).read_text(encoding="utf-8")
+        assert "decide(" in src, f"{name} 没有接上签名判据"
+        assert "* 2 <" not in src, f"{name} 里出现了第二份否决判据"
+    assert "* 2 <" in (SCRIPTS / "_followup_shape.py").read_text(encoding="utf-8"), "判据本体不在单一出处"

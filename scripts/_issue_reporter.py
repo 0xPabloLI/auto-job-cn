@@ -16,7 +16,7 @@
   凭证类 PII 并截断。detail 仅来自固定文案或服务端状态消息（detect_risk_signal /
   handle_code），不携带用户材料。
 - **全降级**：gh 未安装/未登录/超时/非零退出一律 [warn] 输出，绝不阻断投递收尾
-  （录屏/台账/report.json 落盘优先）。
+  （截图/台账/report.json 落盘优先）。
 
 消费方：`live_apply._write_session_report`（收尾接线，草稿随 report.json 落盘）；
 本脚本 CLI 是 HITL 模式的确认入口。
@@ -86,8 +86,8 @@ def draft_issue(event, session_id):
         "## 熔断/停批自动报告（#51 `_issue_reporter`）\n\n"
         + "\n".join(rows)
         + f"\n\n**现场材料**：`private/data/live_session/{sid}/report.json`"
-        "（results / reason_stats / 录屏截图索引）。\n\n"
-        "> 按 #51 脱敏纪律，正文只含机械字段，不含公司/岗位/HR 信息；请结合 report.json 与录屏定位。"
+        "（results / reason_stats / 截图索引）。\n\n"
+        "> 按 #51 脱敏纪律，正文只含机械字段，不含公司/岗位/HR 信息；请结合 report.json 与会话目录截图定位。"
     )
     return {"breaker": breaker, "title": title, "body": body}
 

@@ -22,6 +22,3 @@ fmt
 # PlatformBase.apply / ChatFirstPlatform.apply（#44 后为 NotImplementedError 空接口）与
 # lagou/liepin stub 的对齐形参——调用方按签名传参，形参本身不使用是设计
 opts
-
-# test_live_apply _open_session_dirs 替身 lambda 的对齐形参（base/vbase 双目录签名）
-vbase

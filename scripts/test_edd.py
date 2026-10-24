@@ -369,3 +369,85 @@ def test_render_density_prompt_lists_candidates_and_manual_gate():
     assert "#27 项 4" in text, "联动提示（triage #45）：触发时与项 4 分组评估同会话处理"
     empty = _edd.render_density_prompt(verdict, [])
     assert "暂无" in empty
+
+
+# --- #63 切片 B：样本数下降不静默（appended_decline）+ 快照分母（验收 4）---
+
+
+def _snap(sample, replied=2, denominator=None, day=1):
+    ev = _evaluation(sample=sample, replied=replied)
+    return _edd.trend_snapshot(ev, profile="p", now=datetime(2026, 10, day, 8, 0, 0), denominator=denominator)
+
+
+def test_append_trend_flags_declining_sample_size_but_still_writes(tmp_path):
+    """#63 验收 4：样本数低于趋势最新一条 ⇒ **已写盘**，状态点名下降（不静默追加）。
+    判序仍只有一份、仍在咽喉里：duplicate → false_zero → 写盘 →（下降则 appended_decline）。
+    把 decline 做成「拒写」就是把报告冻在旧读数上——正是用户否决原票面修法的那条理由。"""
+    p = _seed_sizes(tmp_path / "eval_trend.jsonl", [59])
+    assert _edd.append_trend(p, _snap(52)) == _edd.TREND_APPENDED_DECLINE
+    assert [e["sampleSize"] for e in _edd.load_trend(p)] == [59, 52], "decline 是额外状态，不是拒绝"
+
+
+def test_append_trend_does_not_call_a_non_decline_decline(tmp_path):
+    """不宣布下降的三种：样本增加、样本持平（`<` 不是 `<=`）、历史为空（冷启动首点没有可比对象）。
+    「无从比较」念成「样本下降」是新造的谎，所以这三条都要钉住。"""
+    p = _seed_sizes(tmp_path / "eval_trend.jsonl", [40])
+    assert _edd.append_trend(p, _snap(52)) == _edd.TREND_APPENDED
+    q = _seed_sizes(tmp_path / "eval_trend_q.jsonl", [52])
+    assert _edd.append_trend(q, _snap(52, replied=1, day=2)) == _edd.TREND_APPENDED
+    assert _edd.append_trend(tmp_path / "fresh.jsonl", _snap(52)) == _edd.TREND_APPENDED
+
+
+def test_append_trend_needs_int_sample_to_claim_decline(tmp_path):
+    """历史最新一条的 sampleSize 不是整数（缺键 / 串 / 布尔）⇒ 不判下降，照常 appended：
+    读数不是 int 就不参与比较（排除 `True` 的形态同 `_inbound_watermark._as_int_ts`）。"""
+    for index, bad in enumerate(({}, {"sampleSize": "59"}, {"sampleSize": True}, {"sampleSize": None})):
+        p = tmp_path / f"bad_{index}.jsonl"
+        p.write_text(json.dumps({"ts": "2026-09-29T08:00:00", "profile": "p", **bad}) + "\n", encoding="utf-8")
+        assert _edd.sample_declined(_snap(52), _edd.load_trend(p)) is False, bad
+        assert _edd.append_trend(p, _snap(52)) == _edd.TREND_APPENDED, bad
+
+
+def test_is_appended_is_the_only_written_question():
+    """「写没写盘」只有一个问法（#63 切片 B）：两个 appended 状态都算写了。
+    调用方写 `== TREND_APPENDED` 会把 decline 那一场读成「没写」，给它编一句未追加的谎。"""
+    assert _edd.is_appended(_edd.TREND_APPENDED) is True
+    assert _edd.is_appended(_edd.TREND_APPENDED_DECLINE) is True
+    for status in (_edd.TREND_DUPLICATE, _edd.TREND_FALSE_ZERO, None, "", "appended_loudly"):
+        assert _edd.is_appended(status) is False, status
+
+
+def test_trend_snapshot_denominator_key_is_always_present():
+    """恒在键 `denominator`：没接到分母就是 `None`，**不补 0**
+    （0 是一条读数，None 才是「这一格这次没有读数」，口径同 #61/#65/切片 A）。"""
+    plain = _edd.trend_snapshot(_evaluation(sample=52), profile="p")
+    assert plain["denominator"] is None and "denominator" in plain
+    given = {"conversations": 76, "shape": "scattered_lost"}
+    assert _edd.trend_snapshot(_evaluation(sample=52), profile="p", denominator=given)["denominator"] == given
+
+
+def test_same_sample_different_denominator_is_not_duplicate(tmp_path):
+    """`_content_key` 是「除 ts 外全内容」，加了分母之后「同样本、不同分母」**不再算 duplicate**——
+    这是本切片的**目的**不是副作用（票面验收 4：样本没变但会话清单掉了 24 条，趋势里要看得见）。
+    后续 session 若把它当回归改回「只看样本数」，这条会红。"""
+    p = tmp_path / "eval_trend.jsonl"
+    first = _snap(52, denominator={"conversations": 100, "shape": "stable"}, day=1)
+    second = _snap(52, denominator={"conversations": 76, "shape": "scattered_lost"}, day=2)
+    assert _edd.append_trend(p, first) == _edd.TREND_APPENDED
+    assert _edd.append_trend(p, second) == _edd.TREND_APPENDED
+    assert [e["denominator"]["conversations"] for e in _edd.load_trend(p)] == [100, 76]
+    # 负对照：分母也一样时才是幂等跳过（判据没被改成「永远追加」）
+    third = _snap(52, denominator={"conversations": 76, "shape": "scattered_lost"}, day=3)
+    assert _edd.append_trend(p, third) == _edd.TREND_DUPLICATE
+
+
+def test_history_without_denominator_appends_once_not_as_broken_dedupe(tmp_path):
+    """历史条目**没有** `denominator` 键 ⇒ 同一份内容的快照必然再追加一次。
+    这是键集合变化的结果，不是 duplicate 判据坏了（否则历史里每一条都要被误判成重复）。"""
+    snap = _snap(52, day=2)
+    legacy = {k: v for k, v in snap.items() if k != "denominator"}
+    legacy["ts"] = "2026-10-01T08:00:00"
+    p = tmp_path / "eval_trend.jsonl"
+    p.write_text(json.dumps(legacy, ensure_ascii=False) + "\n", encoding="utf-8")
+    assert _edd.append_trend(p, snap) == _edd.TREND_APPENDED
+    assert len(_edd.load_trend(p)) == 2

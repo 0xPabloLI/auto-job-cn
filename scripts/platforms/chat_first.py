@@ -6,7 +6,7 @@ import re
 import time
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, unquote_plus
 
 from . import PlatformBase
 from _forensics import (  # noqa: E402  #56 取证 A：handler 往返计数的登记与往返前后的拍点（状态归 `_forensics`）
@@ -24,6 +24,12 @@ from _forensics import (  # noqa: E402  #56 取证 A：handler 往返计数的�
     listener_attached,
     listener_detached,
 )
+
+# 一条会话的键规则只有**一份**（#75 定的 `encryptJobId` ∪ `encryptUid`、任一命中即同一条）。
+# 会话列表的并集去重（#63 切片 A）与水位线的「新增哪几条」判的是同一个问题，各写一份就会在
+# 「会话回填了岗位键」那一刻分叉（#75 review 条目 I 的坑）。`_inbound_watermark` 只依赖 stdlib
+# 与 `_atomic_io`，不 import 平台层 ⇒ 这条 import 不成环（已实测导入可用）。
+from _inbound_watermark import session_keys
 
 LOGIN_DIALOG_SELECTOR = ".boss-login-dialog, .boss-login-dialog-mask"
 # 整页登录变体（2026-10-20 实测）：掉登录时会被导到 `https://www.zhipin.com/web/user/`，
@@ -537,6 +543,28 @@ def search_via_input(page, query, rng=None):
     return False
 
 
+# #94 验收 4：DOM 抓取与落空命中探测的**同一份真源**。钉成模块常量、而不是两侧各留一份局部列表，
+# 是因为 `zero_hits` 这个读数的效力全在于「探针探的那组＝抓取吃的那组」——一边改了另一边没改时，
+# 探针报出来的「全落空」描述的就是一套抓取永远不吃到的选择器，证据降级成假证据（票面「盲区不能各修一半」）。
+# 切片 B（#94 验收 2）追加的第 9 条 `.job-detail-body .desc` 只挂**末尾**、且**必须带 `.job-detail-body`
+# 作用域**：挂末尾让已验证的独立详情页形态继续优先按原 8 条取（对旧形态零行为变更）；带作用域是因为
+# 抓取走 `document.querySelector(s)`——只取文档序首个命中，而分栏页里同名 `desc` 的促销节点排在 JD 前面。
+# 旧 8 条内容由 `grab_detail` 的既有局部列表原样上移，内容与顺序由 test_platforms 那三条用例机械守住；
+# 同名节点有几个、各是什么标签与长度这类形态读数只在
+# `内部调研笔记目录（未随本仓分发）boss-recommend-card-shape.md` §15.4 记一份，本注释不抄副本（#59 立的「副本改成指针」）。
+DETAIL_JD_SELECTORS = [
+    ".job-sec-text",
+    ".job-detail .text",
+    ".job-detail .job-sec",
+    ".job-sec .text",
+    ".job-detail .describe",
+    ".job-detail-content",
+    '[class*="job-sec-text"]',
+    '[class*="job-detail"] [class*="text"]',
+    ".job-detail-body .desc",
+]
+
+
 # #56 A5：落空时的一次性选择器命中探测（**只在失败退出前跑一次**，成功路径零成本）。
 # 为什么轮询答不出、必须另探一次：DOM 轮询的判据是「有没有 >20 字的文本」，它只能告诉
 # 「没拿到正文」，告诉不了「选择器根本不存在」还是「选择器存在但正文为空」——而这两者正是
@@ -555,9 +583,12 @@ _DETAIL_PROBE_JS = """(sels) => sels.map((s) => {
 })"""
 
 
-def _record_empty_detail(page, detail_data, selectors, beat, timings):
+def _record_empty_detail(page, detail_data, beat, timings):
     """grab_detail 落空 exit 前落证据：一次选择器命中探测 + 等待时长，写进调用方的
     详情容器（`detail_data["empty_outcome"]`）。
+    探针吃的那组选择器不作出参、直接读模块常量 `DETAIL_JD_SELECTORS`（#94 验收 4）：
+    「一份真源」要由结构保证，不能靠调用点自觉传对——留一个 selectors 形参，就等于留一个
+    「第二个调用点传进另一份列表」的口子，而那样落出来的 `zero_hits` 是假证据。
     为什么归因走容器字段而不是改返回类型：`grab_detail` 的返回值（str）已被 `_acquire_and_draft_greeting`
     与既有 8 个用例按「空串=没拿到」消费，加第二个出参会把「返回契约一字未动」这条 A3 已经
     守住的边界再破一次；容器本来就是监听器与消费方共享的可变信道（`data`/`errors` 同例）。
@@ -565,7 +596,7 @@ def _record_empty_detail(page, detail_data, selectors, beat, timings):
     整体吞异常：取证失败最多退回「零可观测」，绝不能把落空出口变成抛异常的地方（#38 同口径）。"""
     try:
         beat("jd:dom-probe:pre")
-        probe = page.evaluate(_DETAIL_PROBE_JS, selectors)
+        probe = page.evaluate(_DETAIL_PROBE_JS, DETAIL_JD_SELECTORS)
         beat("jd:dom-probe:post")
         if not isinstance(probe, list):
             # 探测结果形态异常时**不写命中数**：`hit_total: 0` 会被下游读成「选择器全落空」
@@ -620,6 +651,8 @@ def detail_post_description(payload):
 
 def grab_detail(page, detail_data, beat_fn=None):
     """详情 JD：优先 DOM（多选择器+轮询），fallback XHR。
+    #94 验收 4：DOM 抓取轮与落空探针用的选择器都是模块常量 `DETAIL_JD_SELECTORS` 本身
+    （同一份真源，不在函数里另起局部列表，也不作入参递进 `_record_empty_detail`——理由见该常量定义处的注释）。
     #56 A3：两段轮询里的 `page.evaluate`（evaluateExpression，timeout=None）与
     `wait_for_timeout` 是票面点名的同族无超时/长停站点，逐轮前后拍点（label 带轮次），
     使「死在 DOM 轮询第几轮 / XHR 空等第几轮」不靠栈也读得出。
@@ -639,22 +672,12 @@ def grab_detail(page, detail_data, beat_fn=None):
         }
         return '';
     }"""
-    selectors = [
-        ".job-sec-text",
-        ".job-detail .text",
-        ".job-detail .job-sec",
-        ".job-sec .text",
-        ".job-detail .describe",
-        ".job-detail-content",
-        '[class*="job-sec-text"]',
-        '[class*="job-detail"] [class*="text"]',
-    ]
     t0 = time.time()
     dom_rounds = 0
     while time.time() - t0 < 5:
         dom_rounds += 1
         beat(f"jd:dom-poll:{dom_rounds}:pre")
-        dom = page.evaluate(dom_js, selectors)
+        dom = page.evaluate(dom_js, DETAIL_JD_SELECTORS)
         beat(f"jd:dom-poll:{dom_rounds}:post")
         if dom:
             return dom
@@ -680,7 +703,6 @@ def grab_detail(page, detail_data, beat_fn=None):
     _record_empty_detail(
         page,
         detail_data,
-        selectors,
         beat,
         {
             "dom_rounds": dom_rounds,
@@ -997,10 +1019,14 @@ def read_state(rec):
     return "read" if u == 0 else "unknown"
 
 
-def build_report(results, generated_at, my_user_id=None):
+def build_report(results, generated_at, my_user_id=None, collection=None):
     """结构化对话 → 统计报告。`myUserId` 恒在（#73）：发送后的 wapi 回读要判「末条 fromId
     是不是我方」，而 userId 只有采集那一刻从 `getUserInfo` 响应里拿得到，不跟着报告出来，
-    回读侧就只能靠猜或再发一次请求。采集时没拿到就是 None（回读侧据此 fail-closed）。"""
+    回读侧就只能靠猜或再发一次请求。采集时没拿到就是 None（回读侧据此 fail-closed）。
+    `followupCollection`（#63 切片 A）同样恒在：采集到底走了哪条出口、接口回了几批各几条、
+    前端下发了多少个 id、并集去重后剩几条、几条没有可用键。残缺判定与「拿全没拿全」的归因都
+    要从这几格读，不能再靠肉眼比对两次终端行数；调用方没给时七个键都在、值为 None
+    （「这一格这次没有读数」≠ 读数是 0，口径同 #61 的 `source=null`）。"""
     replied = [r for r in results if r["status"] == "hr_replied"]
     awaiting = [r for r in results if r["status"] == "awaiting"]
     total = len(results)
@@ -1031,8 +1057,20 @@ def build_report(results, generated_at, my_user_id=None):
         "unlinkedRepliedUnread": waiting_states.count("unread"),
         "unlinkedRepliedRead": waiting_states.count("read"),
         "unlinkedRepliedReadUnknown": waiting_states.count("unknown"),
+        "followupCollection": _collection_reading(collection),
         "conversations": results,
     }
+
+
+# 采集形态读数的键集合（#63 切片 A）。写成常量是因为护栏侧（`live_apply._collect_fresh_followup`
+# 与 `followup_tracker.run`）要按同一组名字取值：两边各抄一份字符串，改一处就静默读空气。
+COLLECTION_KEYS = ("path", "batches", "batchSizes", "maxBatch", "requestedIds", "union", "unkeyed")
+
+
+def _collection_reading(collection):
+    """调用方给的采集形态字典 → 键恒在的读数（缺的键落 None，多余的键丢掉）。"""
+    given = collection if isinstance(collection, dict) else {}
+    return {key: given.get(key) for key in COLLECTION_KEYS}
 
 
 CONVS_JS = """() => {
@@ -1061,6 +1099,163 @@ CONVS_JS = """() => {
 }"""
 
 
+def _requested_friend_ids(resp):
+    """这一批 `getGeekFriendList` 的请求体里前端下发的那些 `friendIds`（#63 切片 A）。
+    这一格答的是「站点手上就只有这些」还是「接口回得比请求少」——两者的处置完全不同，
+    而旧出口只留条数，读不出来。返回 id 的集合，各批合并后按**不同 id 的个数**念出来
+    （相加会把重复的会话念成两条）。
+
+    取不到返回 **None**，不返回空集合：空集合会被读成「前端一条会话都没下发」，而那正是这条
+    读数要回答的问题（本仓 `null ≠ 0` 口径，同 #61 的 `source=null`、#65 的 `recommend_*=null`）。
+    读 request 是响应体之外的额外动作，不外抛、不影响采集本身——但**访问形态错了不许静默**：
+    `Response.request` 是属性不是方法，写成 `resp.request()` 会抛 `TypeError`（真机踩过一次，
+    当时被兜底吃成恒 `None`，报告与「站点没下发 id」长得一模一样），所以那类异常单独喊一行。"""
+    try:
+        post_data = resp.request.post_data
+    except (TypeError, AttributeError) as e:
+        print(
+            f"[warn] 读不到 request.post_data（访问形态不对？{type(e).__name__}: {str(e)[:60]}）"
+            "——`requestedIds` 落 None，这一格在真机上问不出东西"
+        )
+        return None
+    except Exception:
+        return None
+    if isinstance(post_data, bytes):
+        try:
+            post_data = post_data.decode("utf-8", "replace")
+        except Exception:
+            return None
+    if not post_data:
+        return None
+    for pair in post_data.split("&"):
+        name, _, value = pair.partition("=")
+        if name != "friendIds" or not value:
+            continue
+        return {part for part in unquote_plus(value).split(",") if part} or None
+    return None
+
+
+def _entry_last_ts(entry):
+    """条目的末条消息时间（毫秒）。读不到可用数值 ⇒ **None**，不当 0：当 0 就等于「永远更旧」，
+    会把真正有值的那份新读数丢掉。"""
+    value = entry.get("lastTS") if isinstance(entry, dict) else None
+    return value if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+
+def _fresher_entry(candidate, incumbent):
+    """同一条会话在两批里都出现时留哪一份：留 `lastTS` 大的那份。
+    比的**不是到达顺序**——站点可能在这 15s 窗口里重放一次更早的读数，「后到」不等于「新」。
+    两侧都读不到 `lastTS` ⇒ 保留在位那份（不为换而换）；一侧读不到 ⇒ 有值的那侧赢。
+
+    这条是切片 A 自查时补的：并集原本是「先到即留」，那会把已经刷新过的 `lastMsg`/`lastTS`
+    停在旧值上。而 #75 的水位线拿 `lastTS` 比线、#73 的发送回读拿 `lastMsg` 全等判末条归属——
+    陈旧值不是「少一条」那种显眼的错，是判据安静地读到过期数据。"""
+    new_ts, old_ts = _entry_last_ts(candidate), _entry_last_ts(incumbent)
+    if new_ts is None:
+        return incumbent
+    if old_ts is None:
+        return candidate
+    return candidate if new_ts > old_ts else incumbent
+
+
+def _sorted_newest_first(entries):
+    """按 `lastTS` 降序排（稳定：同一时刻的相对顺序不动），读不到时间的排末尾。
+    列表的新→旧顺序不是排版问题：`_followup_shape.compare` 判「消失项是不是连续尾部」用的就是
+    位置，顺序一乱，首页截断就会被读成站点侧流失、从此不再否决（切片 A 自查补正那条）。"""
+    timed = [entry for entry in entries if _entry_last_ts(entry) is not None]
+    undated = [entry for entry in entries if _entry_last_ts(entry) is None]
+    timed.sort(key=_entry_last_ts, reverse=True)
+    return timed + undated
+
+
+def _union_friend_batches(batches):
+    """多批会话条目 → 按会话键的**并集**（#63 切片 A，把这里登记过的假定兑现成出口：
+    实测形态是「一次调用返回全量、各批互为超集」，站点若改成增量分页（批间互不包含），
+    旧的「取最大批」会静默丢掉整批，那时正确的出口就是并集）。
+
+    判同一条 = **任一可用键相同**（`session_keys`，#75 条目 I 的同一个坑）：同一条 HR 会话
+    可能这场只有 `encryptUid`、下场两个键都有，只比单键会在回填那一刻把它念成两条新会话。
+    没有任何可用键的条目（DOM 降级卡片正是这个形态）不静默丢、也不互相合并——没有依据说
+    它们是同一条；另数 `unkeyed`（口径同 #75 的零键拒写）。
+    **位置按 `lastTS` 降序、内容按 `_fresher_entry` 取最新**：站点给的列表就是新→旧，这条不变量
+    是 `_followup_shape.compare` 那个「消失项是否构成连续尾部」判据的前提。按首次出现排会把
+    后批**头部**新增的那条会话放到列表末尾，于是下一场的真·首页截断被读成 `scattered_lost`
+    ⇒ 不否决 ⇒ 截断版覆盖掉全量报告——#59 那场事故换条路回来（双轴 review 查出、/tmp 复现：
+    97 条 + 头部新增 1 条 ⇒ 并集末位是 NEW，`decide` 回 `scattered_lost / veto=False`）。
+    超集形态下这样排序与旧的最大批逐字同序同内容（前缀型与头部型两条用例各钉一边）。
+    读不到 `lastTS` 的有键条目排在末尾（时间未知＝不冒充最新），条数不因此变。
+    两个键把两条已收条目连成同一条时（同一会话先只带 uid、后带 uid+eid，中间还各收过一次），
+    保留靠前那个位置、丢掉靠后那条——并集不许把一条会话数成两条，否则 #63 的残缺判据会读到
+    一次假的增长。"""
+    slot_of = {}
+    out = []
+    dropped = set()
+    unkeyed = 0
+    for batch in batches:
+        for entry in batch:
+            keys = session_keys(entry) if isinstance(entry, dict) else ()
+            if not keys:
+                unkeyed += 1
+                out.append(entry)
+                continue
+            hits = {slot_of[key] for key in keys if key in slot_of}
+            if hits:
+                slot = min(hits)
+                for other in hits - {slot}:
+                    dropped.add(other)
+                    for key, target in list(slot_of.items()):
+                        if target == other:
+                            slot_of[key] = slot
+                out[slot] = _fresher_entry(entry, out[slot])
+                for key in keys:
+                    slot_of.setdefault(key, slot)
+                continue
+            slot = len(out)
+            out.append(entry)
+            for key in keys:
+                slot_of.setdefault(key, slot)
+    return _sorted_newest_first([entry for index, entry in enumerate(out) if index not in dropped]), unkeyed
+
+
+def _finish_followup(page, entries, unkeyed, batches, requested, uid, applied):
+    """并集之后、`build_report` 之前的那段：组采集形态读数、打两行人、挑出口（wapi / DOM 降级）。
+    单独成函数有两个理由：`followup` 的语句数已经容不下它（`ruff.toml` 的 max-statements=50，
+    #44 降到 50 后全仓绿，不再为观测层开豁免）；以及这整段是「读数 + 呈报」，与上面那段
+    「等窗口 + 收批」的两条职责本来就该分开。返回 `(results, collection)`，一条判据都不改。"""
+    batch_sizes = [len(b) for b in batches]
+    collection = {
+        # 出口只有两种：wapi 并集段真有条目 / 走 DOM 降级。降级时下面几格描述的是
+        # 「wapi 那一段发生了什么」（批次 0 或全是空批），不是 DOM 抓到的条数——
+        # DOM 的条数恒在 `totalConversations` 里，两件事别混着念。
+        "path": "wapi" if entries else "dom",
+        "batches": len(batches),
+        "batchSizes": batch_sizes,
+        "maxBatch": max(batch_sizes) if batch_sizes else None,
+        "requestedIds": len(requested) if requested is not None else None,
+        "union": len(entries),
+        "unkeyed": unkeyed,
+    }
+    ids_cell = "未知" if collection["requestedIds"] is None else collection["requestedIds"]
+    reading_line = (
+        f"[采集形态] 批次 {collection['batches']}（各批 {batch_sizes}）"
+        f"｜前端下发 id {ids_cell}｜并集 {collection['union']}｜无可用键 {unkeyed}"
+    )
+    if entries:
+        print(
+            f"[会话列表] wapi 拿到 {len(entries)} 条"
+            + (f"（userId {uid}）" if uid else "（userId 未捕获，status 兜底判定）")
+        )
+        # 批次 >1 且并集 == 最大批 ⇒ 各批互为超集（实测形态）；并集 > 最大批 ⇒ 后批带来了
+        # 前批没有的会话（增量分页形态）。这一行让两种现场当场分得开，不必事后肉眼比行数。
+        print(reading_line)
+        return parse_friend_entries(entries, uid, applied), collection
+    print("[会话列表] wapi 未命中，降级结构化 DOM 抓取")
+    print(reading_line)
+    cards = page.evaluate(CONVS_JS)
+    print(f"[对话列表] {len(cards)} 个")
+    return parse_dom_cards(cards, applied), collection
+
+
 class ChatFirstPlatform(PlatformBase):
     name = "chat-first"
     login_dialog_selector = LOGIN_DIALOG_SELECTOR
@@ -1079,11 +1274,13 @@ class ChatFirstPlatform(PlatformBase):
         raise NotImplementedError("apply 随挂机盲投链路清理（#44）；投递由 live_apply 承担")
 
     def followup(self, page, applied, beat_fn=None, detach=False):
-        """打开消息页拿会话列表（#30 修复）：wapi 拦截为主链路（getGeekFriendList 结构化
-        全量，带 encryptJobId 与毫秒时间戳），结构化 DOM 降级；字段映射见
+        """打开消息页拿会话列表（#30 修复）：wapi 拦截为主链路（getGeekFriendList 结构化字段齐，
+        带 encryptJobId 与毫秒时间戳），结构化 DOM 降级；字段映射见
         内部调研笔记目录（未随本仓分发）boss-chat-card-shape.md。探测结论：聊天实时流走 WS
         （wss://ws6.zhipin.com/chatws），page.on("response") 抓不到，但不逆向——
-        会话列表数据 wapi 已完整覆盖。
+        会话列表数据 wapi 够用（**「够用」不等于「拿全」**：这个端点按前端下发的 `friendIds`
+        逐条回查元数据，条数天花板在「这一刻前端加载了多少条会话」，读法边界见同一文档 §8；
+        #63 就是被这句话的另一种读法带偏过一次）。
         #59 修复轮 R4-1：beat_fn 形参（#56 A3 同形态，`grab_detail` / `find_comm_button` 一致）——
         平台层不知道心跳为何物，由调用方注入并自行吞异常，默认 None = 零行为变更。本段的
         「goto 上界 + 固定停顿」是会话内最长的合法静默区间之一，拍点让它落在取栈阈值之下。
@@ -1093,7 +1290,7 @@ class ChatFirstPlatform(PlatformBase):
         自己挂的那个；中途异常时保持挂着（诚实读数），由会话收尾关闭页面。注销失败时计数同样
         保持挂着并打警告——重复读的代价只是多一个解析器。"""
         beat = beat_fn or _no_beat
-        captured = {"friends": None, "uid": None}
+        captured = {"batches": [], "uid": None, "requested_ids": None}
 
         def h(resp):
             try:
@@ -1101,7 +1298,14 @@ class ChatFirstPlatform(PlatformBase):
                 if FRIEND_LIST_URL_FRAG in url:
                     j = _resp_json_with_forensics(resp, FRIEND_LIST_URL_FRAG)
                     if j.get("code") == 0:
-                        captured["friends"] = j.get("zpData", {}).get("result") or []
+                        captured["batches"].append(list(j.get("zpData", {}).get("result") or []))
+                        # 各批请求体的 friendIds 合起来数一次（前端一共下发过多少条不同的会话
+                        # 键）。读数要回答的是「站点就只有这些」还是「接口回得比请求少」，所以
+                        # 按值去重而不是把每批的个数相加。取不到可读请求体时保持 None。
+                        ids = _requested_friend_ids(resp)
+                        if ids is not None:
+                            base = captured["requested_ids"] or set()
+                            captured["requested_ids"] = set(base) | ids
                 elif USER_INFO_URL_FRAG in url:
                     j = _resp_json_with_forensics(resp, USER_INFO_URL_FRAG)
                     if j.get("code") == 0:
@@ -1137,19 +1341,20 @@ class ChatFirstPlatform(PlatformBase):
             return None
 
         # wapi 响应可能晚于 goto 返回：把这段轮询窗口扫满（FRIEND_POLL_ROUNDS ×
-        # FRIEND_POLL_INTERVAL_MS = 50 × 300ms ≈ 15s，轮数与间隔一字不改），期间保留**条数最多的
-        # 那一批**，窗口结束后写回 captured["friends"]。
+        # FRIEND_POLL_INTERVAL_MS = 50 × 300ms ≈ 15s，轮数与间隔一字不改），每批到达都由 handler
+        # 收进 captured["batches"]，窗口结束后按会话键取并集。
         # #59（二轮）：出口既不是「第一个非空响应」（照单全收首屏）也不是上一版实现的
         # 「条数连续两轮不再增长」——那还是在猜到达时序，实测两个反例：① 下一批推迟到第 3 个
         # 等待节拍 ⇒ 提前定稿只返回 3 条（阈值没跟真实到达间隔对表）；② 递减形态 100 → 3 ⇒
-        # 返回 3，比旧实现更差。扫满窗口取最大值不新增任何可调阈值，读数不再取决于「哪一次
-        # 响应被当成终点」。
-        # **「取最大批＝拿全」是假定，不是实测结论**：实测到的形态是站点**一次调用返回全量**
-        # （内部调研笔记目录（未随本仓分发）boss-chat-card-shape.md §3「一次调用返回全部 61 条，观测窗口内滚动未触发
-        # 分页调用」），于是各批之间互为**超集**，最大批即全量。风险留在这里：若站点改成
-        # **增量分页**（每批是不同页、互不包含），取最大批会**静默丢批**——那时正确的出口是按
-        # encryptJobId 取**并集**。本函数与 `test_platforms.py` 的桩序列（3 → 50 → 50、100 → 3）
-        # 建模的都是「超集到达」这一种形态，不构成对增量形态的覆盖，别把它读成既成事实。
+        # 返回 3，比旧实现更差。扫满窗口不新增任何可调阈值，读数不再取决于「哪一次响应被当成终点」。
+        # **#63 切片 A 把出口从「最大批」改成「并集」**：这一版之前的注释登记过一条假定——
+        # 「取最大批＝拿全」成立的前提是站点一次调用返回全量、各批互为超集（实测形态，
+        # 内部调研笔记目录（未随本仓分发）boss-chat-card-shape.md §3：61 个 friendIds 回 61 条，观测窗口内滚动
+        # 未触发新的分页调用）。超集形态下并集与最大批逐字同序同数（`test_platforms.py` 两条
+        # superset 用例钉住），增量分页形态下最大批会静默丢掉整批、并集不会（那条用例先在
+        # baseline 上红在「3 != 6」）。这条改动**不解决「拿全」**：拿全要的是上游 id 来源，
+        # 它不在本函数的拦截面上（同一份 §3 与 #73 的判定），所以这里同时把形态落成读数，
+        # 让「没拿全」下次是可读出来的，而不是靠肉眼比对两场的终端行数。
         # 静默时长与阈值对表（`docs/agents/implementation-workflow.md` §7 的专门义务）：两次拍点之间
         # 最长的合法静默 = 聊天页 goto 上界 60s + 固定停顿 6s = **66s**（轮询段本身逐轮拍点，
         # 无心跳上界 = 间隔 300ms）；66 < `_forensics.WEDGE_STACK_SECONDS`（90s）<
@@ -1158,29 +1363,31 @@ class ChatFirstPlatform(PlatformBase):
         # 复发形态正是「合法静默顶穿取栈阈值」）。上一版这里写的「合计 ≈21s 静默」漏算了
         # goto 的 90s 上界（真实最坏 111s > 90s），算术现在由常量供给、由
         # `test_live_apply.test_followup_chat_page_silence_ceiling_sits_below_both_thresholds` 钉住。
-        # 一致性：wapi 整场没命中（captured["friends"] is None）与命中但最大批为空，**都**在
-        # 扫满窗口后走下面的 DOM 降级——空批不当成「拿到了数据」，两条路径的等待时长相同。
-        # （取的是各等待节拍上读到的最大值，采样密度与上一版一致，未改成按响应到达计数。）
-        best_batch = None
+        # 一致性：wapi 整场没回（批次 0）与回了但每批都是空列表，**都**在扫满窗口后走下面的
+        # DOM 降级——空批不当成「拿到了数据」，两条路径的等待时长相同。两者在 `batches`
+        # （0 与 ≥1）与 `maxBatch`（None 与 0）上是两种读数，别合并成一句「没采到」。
+        # 窗口期间每批都收，不再「哪一次读数算终点」——出口是按键并集，采样密度与上一版一致。
         for round_no in range(1, FRIEND_POLL_ROUNDS + 1):
             beat(f"followup:wait-friends:{round_no}")
-            friends = captured["friends"]
-            if friends is not None and (best_batch is None or len(friends) > len(best_batch)):
-                best_batch = friends
             page.wait_for_timeout(FRIEND_POLL_INTERVAL_MS)
-        if best_batch is not None:
-            captured["friends"] = best_batch
 
-        if captured["friends"]:
-            print(
-                f"[会话列表] wapi 拿到 {len(captured['friends'])} 条"
-                + (f"（userId {captured['uid']}）" if captured["uid"] else "（userId 未捕获，status 兜底判定）")
-            )
-            results = parse_friend_entries(captured["friends"], captured["uid"], applied)
-        else:
-            print("[会话列表] wapi 未命中，降级结构化 DOM 抓取")
-            cards = page.evaluate(CONVS_JS)
-            print(f"[对话列表] {len(cards)} 个")
-            results = parse_dom_cards(cards, applied)
+        batches = captured["batches"]
+        entries, unkeyed = _union_friend_batches(batches)
+        # 读数组装、两行人呈报与出口选择在 `_finish_followup`（职责分开 + max-statements 不再
+        # 为观测层开豁免），它只读上面这些值，不改判据。
+        results, collection = _finish_followup(
+            page,
+            entries,
+            unkeyed,
+            batches,
+            captured["requested_ids"],
+            captured["uid"],
+            applied,
+        )
         _detach()
-        return build_report(results, generated_at=time.strftime("%Y-%m-%d %H:%M:%S"), my_user_id=captured["uid"])
+        return build_report(
+            results,
+            generated_at=time.strftime("%Y-%m-%d %H:%M:%S"),
+            my_user_id=captured["uid"],
+            collection=collection,
+        )

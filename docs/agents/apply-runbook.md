@@ -26,7 +26,7 @@
 
 ## 实时投递（`scripts/live_apply.py`）
 
-浏览会话中实时看 JD → 实时起草 → 当场发送。无预爬、无预写队列，岗位从列表**点卡片**进入（不再直跳 URL）。全程 webm 录屏 + 动作截图序列（滚动/点击/打字瞬间），供用户事后回看。
+浏览会话中实时看 JD → 实时起草 → 当场发送。无预爬、无预写队列，岗位从列表**点卡片**进入（不再直跳 URL）。动作截图序列（滚动/点击/打字瞬间）逐岗落 `shots/`，供用户事后回看。
 
 岗位有**两个来源**（#33）：**推荐列表**（顶栏「职位」页的无 query 模式；默认开启）+ **搜索流**（按 profile `queries` 逐词搜索）。**顺序（#61 方案 A，2026-10-06）：推荐流一轮在关键词轮之前跑**——旧顺序把它排在所有搜索轮之后、且开轮条件含「未停批」，于是任何停批信号都会让第二来源整段缺席（实测会话 `20261005-215607` 的 `recommend_listing=null`）。**代价（本文件只在这里写一遍）**：推荐流从「用剩余额度」变成「先吃额度」，`_collect_target` 随已投数收缩，后面的关键词轮候选目标数变小、额度吃满时不再有投递额度；退路是 `LIVE_RECOMMEND=off`（回到纯搜索流）。**推荐轮另有消费配额（#65）**：采集照旧滚到底，只消费排在前面的若干候选；**它管「吃多少个」、`LIVE_COLLECT_CAP` 管「看多少条」是分开的两件事，怎么调配比与代价只写在 `docs/agents/apply-tuning.md` 的 `LIVE_RECOMMEND_CAP` 那一条**。**两个来源共用同一个页面** `/web/geek/jobs`，都靠滚动加载，实现会**持续滚到底累积**。两来源合并后按 `encryptJobId` 统一去重，同一岗位全局只投一次。`report.json` 的 `direct_fallback` 是**两类混在一起**的计数（`live_apply` 的 `_enter_and_inspect_job` 记账）：`direct_no_card`＝列表页没有 DOM 锚点、按正常数据态直跳（**非零属预期内**，锚点覆盖率随页面版本变化），`direct_click_failed`＝点了卡片却没成功、直跳是兜底（这才是 #50 熔断的分母，占比超 `DIRECT_FALLBACK_STOP` 即停批）。**汇报时按 `card_clicks` / `card_click_fails` / `direct_no_card` 分开报**，别把 `direct_fallback` 一个数当成「真实退化率」。形态、端点、到底判据与采集深度见 `内部调研笔记目录（未随本仓分发）boss-recommend-card-shape.md` §10（探测护栏见 §9.5）。
 
@@ -39,7 +39,7 @@
    import load_config;print(load_config({}))"`，布尔 env 的取值表真源在 `_limits.py` 的
    「布尔 env 开关」小节。每轮都可能用到的是两条：`LIVE_PACE=fast`（温和提速预设）与
    `LIVE_QUERIES="词1,词2"`（临时覆盖本次搜索词；设置时按原样、不带 `query_weights` 加轮）。
-   **其余开关**（改起草超时 / 关推荐流 / 关录像 / 调采集上限 / 调保留天数，以及日上限降档判据）
+   **其余开关**（改起草超时 / 关推荐流 / 调采集上限 / 调保留天数，以及日上限降档判据）
    → `docs/agents/apply-tuning.md`；**会话被看门狗击杀，或 `report.json` 出现 `wedge_ledger` /
    `browser_exit`**（止损开关与取证阈值都在那）→ `docs/agents/apply-forensics.md`。
    采集目标另受剩余额度约束（剩余额度 × 3）；「投 100 封」的量就从这里来，日上限仍由
@@ -65,9 +65,11 @@
    **起草规范**（起草时逐条遵守；**当前投递路径以本节为唯一现行规范**——`docs/greeting-prompt-template.md`
    是退役 drafter 时代的模板，与本节同源但已滞后（它内部长度两处不一：100-200 与 120-150），
    只作历史参考）：
-   - **认岗再落盘（2026-09-29 实证）**：写 `reply_N.json` 前先在本轮 `Read`/`cat` 出 `request_N.json`
-     的 `jobName`/`brandName`/`bossName`，抬头与正文按那份 JD 写——脚本按序号取草稿，**上一岗的稿件
-     会被下一岗直接消费并发出**（发出去不可撤回）；`request_N` 还没落盘时不写 `reply_N`，宁可等
+   - **认岗再落盘（2026-09-29 实证，#93 加固）**：写 `reply_N.json` 前先在本轮 `Read`/`cat` 出 `request_N.json`
+     的 `jobName`/`brandName`/`bossName`，抬头与正文按那份 JD 写——脚本按序号取草稿。两道机械兜底已就位
+     （#93 A 一号一岗：补投轮与搜索/推荐轮从同一处续号；#93 C 来历核验：`reply_N` 的落盘时刻早于
+     本岗 `request_N` 就判为陈旧草稿、拒收后继续等），兜底只兜住「错发」这一半，代价是该岗等到
+     `agent_timeout`；**先读到 request 再写 reply** 仍是正路，`request_N` 还没落盘时不写 `reply_N`，宁可等
    - **决策问题不占用草稿窗口（2026-10-05 实证）**：会话进行中**不要**把「要不要/怎么选」这类
      需要用户回话的问题抛出去然后等答复——每个岗位的草稿窗口只有 `LIVE_REPLY_TIMEOUT`（默认值
      现取 `live_apply.REPLY_TIMEOUT_DEFAULT`，本文不抄）加 90s 宽限复查，等到用户回话时岗位早已
@@ -148,6 +150,9 @@
    完成：每个落盘的 `request_N.json` 都有一个 `reply_N.json`（投 or `skip` + `reason`，二者必居其一，
    且 reply 是**读到该岗 JD 之后**写的），并且这些 reply 里**没有出现在 report 的 `gate_blocked`**——
    写了却被拦等于该岗没投，光「有对应文件」不算做完。
+   终端出现「陈旧草稿」那一行（#93 C 的来历核验）＝这个号的 `reply_N` 早于本岗 `request_N`，脚本已拒收
+   并继续等本岗起草。A 之后它只在撞号或会话目录被预先写入时才可能亮 ⇒ 连同步骤 3 的编号账一起按缺陷报；
+   投递轮里该岗始终没等到本岗草稿就走 `agent_timeout` 进补投台账（不是丢岗）。一次等待只报一行。
 3. **等脚本跑完**：脚本依次点卡片→浏览→入队→粘贴/逐字打字（默认 70% 粘贴 30% 打字混合，
    `APPLY_PASTE_PROB` 可调）→发送→go_back，全程截图落盘
    `private/data/live_session/<ts>/shots/`。
@@ -158,27 +163,36 @@
    旧口径「岗位疑已失效即移出」会静默误杀可补投岗，#56 A5 已废）；收尾前对本场 agent
    起草超时的岗位直跳重试一次（起草超时本身先经 90s 宽限复查救迟到草稿）。
    两段都受日上限/风控熔断/excluded 清单/wedge 台账同链约束，dry-run 会话不补投不写台账。
-   完成：`[done]` 分桶播报行出现，**且** EDD 那一行两种形态都算（快照追加了才渲染
+   完成：`[done]` 分桶播报行出现，**且** EDD 那一行**三种形态都算**（快照追加了才渲染
    `## EDD 趋势跟踪` 块，否则打 `[EDD] 跳过趋势快照（原因）`——幂等去重与残缺采集都走后者，
-   实测 `20261005-215607` 就是跳过那支），所以**不要把「EDD 块没出现」读成「还没跑完」**；
-   再核一条：Glob 出的 `request_*.json` 编号集合与 `report.json` 里 `results[].idx` 集合对得上
-   （skip/timeout 也占编号），没有悬空的 request。`[done]` 没出现就是还在跑——
+   实测 `20261005-215607` 就是跳过那支；第三种 `[EDD] 趋势块未渲染（…未带 append 前的趋势历史）`
+   是 #82 的 fail-closed 分支，生产路径正常到不了——它一出现就说明接缝又退化成写后读，按缺陷查），
+   所以**不要把「EDD 块没出现」读成「还没跑完」**；
+   再核一条编号账（不变量 #93 A：一场会话内**一号一岗**）：Glob 出的 `request_*.json` 编号集合与
+   `report.json` 里 `results[].idx` 集合对得上（skip/timeout 也占编号），没有悬空的 request，
+   **且 `results[].idx` 去掉无编号条目（excluded_company / wedge_skipped / 起飞前自检）后逐号唯一**。
+   撞号＝续号链退化，出现就把两份 `request_N.json` 的 `jobName` 一起呈用户并按缺陷报。
+   `[done]` 没出现就是还在跑——
    **提前跑步骤 4 会漏掉本轮发出后才收到的新回复**。
 4. **收尾（不关窗）**：脚本结束后浏览器保持打开，**报告写盘前现场采集一次最新
    followup**（#49，2026-09-24：`[followup] 现场采集 N 条对话` 行，report.json 的
    `followup_fresh` 字段为真）——收尾 EDD 快照与密度判定（`## EDD 趋势跟踪` 块）因此
-   吃到本场投递后的真实回复状态；采集失败**或采到残缺列表**（条数不足上一份的一半，#59）都只
+   吃到本场投递后的真实回复状态；采集失败**或采到残缺列表**（残缺判据＝消失项构成上一份末尾
+   连续一段**且**跌幅过半，#59 立、#63 收成 `_followup_shape.decide` 一处）都只
    warn 降级（`followup_fresh=false`，沿用上一份报告），不阻断收尾——汇报时要说明本场 eval 吃的
-   是上一次复盘的数，别把旧读数当新读数念。
-   用户确认后写 `private/data/live_session/<ts>/CLOSE` 空文件 → 窗口关闭，webm 视频落盘
-   `private/data/videos/<ts>/`，并自动按动作时刻剪辑（剪掉长停留段，产出 `trimmed_*.webm`；
-   依赖 ffmpeg，缺失则保留原片）。
+   是上一次复盘的数，别把旧读数当新读数念。**散落形态不降级**：那是站点侧真把会话移走了
+   （实物见 `内部调研笔记目录（未随本仓分发）boss-chat-card-shape.md` §8），照常覆盖、样本基数随之变小，
+   这种情况终端打 `[清单签名]` 行并点名三个数字（本场／上一份／消失条数）。
+   浏览器**保持打开**（结束不关窗，#39）：`[done]` 之后浏览器窗口保持打开，终端打
+   `[保持] 浏览器保持打开；写 <session_dir>/CLOSE 结束保持（Ctrl+C 亦可）`；用户确认后写
+   `private/data/live_session/<ts>/CLOSE` 空文件结束保持（脚本轮询 CLOSE 哨兵），Ctrl+C 亦可直接退出。
    完成：三段各给一句结论——① 现场采集读数已明确：`report.json` 的 `followup_fresh` **是 true 还是
    false 都要说出来**（false＝走了残缺降级，本场 eval 吃的是上一次复盘的数；缺这个键＝这场没采集，
-   按缺陷报）；② `CLOSE` 已写入；③ 视频按当场的开关分支核对：默认档下
-   `private/data/videos/<ts>/` 有 `trimmed_*.webm`，`LIVE_RECORD=off` 时**本步没有视频可核**、
-   ffmpeg 缺失或自动剪辑子进程失败时以「保留原片/剪辑跳过」的明确降级说明结案（后两种只 warn，
-   不会报错给你看）。
+   按缺陷报）；② `CLOSE` 已写入；③ 收尾读数只有两类——逐岗截图行 `    [录像] 截图 <文件名>`
+   （含失败变体 `[录像] 截图失败`）照常打出、`shots/` 照常产出（这个前缀是**截图**日志，与已下线的
+   录像无关，一直都有）；除此之外全程不出现任何录像/定格/保持段读数行：`[录像] 视频已落盘`／
+   `[剪辑]`／`[保持] 已保持`／`[保持] 保持段录像` 都不该再出现（录像链路已随 #105 下线，出现了按
+   缺陷报）；CLOSE 之后终端收在 `[保持] 收到 CLOSE 信号`。
 5. **followup + 回写**：收尾虽已采集（#49），本步的 followup 重跑仍需要——**标注要读
    HR 回复原文**：`python3 scripts/followup_tracker.py`（重新生成 followup_report.json）→
    Agent 阅读 HR 回复原文，按固定分类法（interested/tech_question/rejected/no_reply +
@@ -211,7 +225,7 @@
    正例池超 25 条上限时 promote-winners 拒绝写入并列出建议淘汰项（FIFO+回复率降权）——
    加 `--retire <片段>` 点名淘汰（片段须恰好命中 1 条）后 --yes 一并执行，绝不静默删除。
 6. **汇报 + 分类反馈（用户约定 2026-09-10）**：除投递/跳过/熔断统计 + `direct_fallback`
-   （直跳回退次数）+ 视频与截图路径外，按 report.json 的 `reason_stats` 向用户反馈
+   （直跳回退次数）+ 截图路径（`shots/`）外，按 report.json 的 `reason_stats` 向用户反馈
    **哪类岗位投了、哪类没投、为什么**（关键词误中/硬语言缺失/薪资段位/非工程岗/领域不符…），
    让用户知道漏了哪类；gate_blocked（发送前机械核验拦截，2026-09-10）也须如实计入——
    被拦了几条、什么违规；salutation_warns（称呼软提醒，#27 项 1）条数同样呈现；
@@ -234,14 +248,15 @@
    会话改为直接汇报已自动开出的票（防重台账 `reported_issues.json` 保证同会话同熔断器
    只开一张；gh 失败只 warn 不阻断收尾，可稍后用同一命令重试）；
    跑长时每投满 5 条左右也可主动给一次小结。
-   完成：汇报逐项覆盖下列十四项，缺任一项都是没汇报完——① 投递/跳过/熔断三类计数，投递数并按
+   完成：汇报逐项覆盖下列十五项，缺任一项都是没汇报完——① 投递/跳过/熔断三类计数，投递数并按
    `applied_by_source` 报**来源分布**（#61：`search` / `recommend` / `retry` / `unknown`；逐条看
    `results[].source`，**`null` 只表示无法归属，不许说成「来自搜索」**——归属按「编号区间 + results
-   切片」双判据，跨会话补投轮的编号区间与搜索流可重叠，单看编号会串）；同一项里报推荐轮的
-   **候选 N / 消费 M**（#65 消费配额：`recommend_candidates` / `recommend_consumed`，差值 N-M 是本场
-   没轮到、不投也不进台账的岗数；M 个里 0 命中而后面的搜索轮有命中时，按 `apply-tuning.md` 调档）；
+   切片」双判据；#93 A 后一场会话一号一岗、补投轮与搜索/推荐轮的号段不再重叠，来源仍只按
+   `results[].source` 念（不从编号反推：切片判据不依赖编号唯一，回读 A 之前的历史 report 也读得对）；
+   同一项里报推荐轮的**候选 N / 消费 M**（#65 消费配额：`recommend_candidates` / `recommend_consumed`，
+   差值 N-M 是本场没轮到、不投也不进台账的岗数；M 个里 0 命中而后面的搜索轮有命中时，按 `apply-tuning.md` 调档）；
    ② `direct_fallback` 计数；③ `reason_stats` 分类反馈（哪类投了/哪类没投/为什么）；
-   ④ 视频与截图路径；⑤ `gate_blocked` 与 `salutation_warns`、`question_warns`（2026-10-16
+   ④ 截图路径（`shots/`）；⑤ `gate_blocked` 与 `salutation_warns`、`question_warns`（2026-10-16
    「结尾只带软问题」约定的软提醒命中，非零＝仍有草稿在问对方答不上来的事）、`keyword_skips` 明细
    （含网络抖动还是环境问题的归因）；补投统计（`[done]` 行「历史超时补投 N 个 /
    本场新增超时 M 个」，#55）出现时纳入——两层补投是自动兜底，汇报让用户知道
@@ -255,9 +270,12 @@
    ⑨ report.json 出现 `browser_exit`（浏览器退出分类，#54）时，如实呈现分类与 evidence
    （pid 探活结果 / 崩溃报告路径），并按「边界」的「浏览器进程消失归因硬规则」处置；
    ⑩ report.json 的 `no_jd_classes` / `no_jd_dom_shapes` / `no_jd_code_nonzero_by_class` /
-   `no_jd_empty_urls` 读数（#56 A5 分流口径）与 `wedge_ledger`（#56 B1 跳岗台账）出现时
-   一并呈报——`no_jd` 的归类分布是「站点往返失败/挂起」与「详情页形态漂移」两假说的
-   分流依据，只报事实与读数，不替用户定性（同 ⑨ 的硬规则）；
+   `no_jd_empty_urls`（#56 A5 分流口径）、`wedge_ledger`（#56 B1 跳岗台账）与 `no_jd_reentries`
+   （#67 三键恒在，重进 0 次也是一条读数；逐岗看 **no_jd 条目**的 `reentered` 与 `jd_chars`）
+   出现时一并呈报——`no_jd` 的归类分布是「站点往返失败/挂起」与「详情页形态
+   漂移」两假说的分流依据，`still_no_jd` 那一支的归因照旧由 `no_jd_classes` 说（重进读数不替它
+   定性，也不许拿它压低 no_jd 计数）；
+   只报事实与读数，不替用户定性（同 ⑨ 的硬规则）；
    ⑪ report.json 的 `no_send_reasons`（#62 四桶：`off_chat` / `send_btn_missing` /
    `send_click_failed` / `other`，恒在）有非零桶时呈报，并说清两类去向——`off_chat`
    是打字**前**的形态守卫拦下的岗（一个字都没进页面，已落 #55 的 `retry_pending`
@@ -284,6 +302,16 @@
    还在等回话」，逐条给公司／职位／原文／读态。这批**只在跑过「入站回复」小节后**才可能已回，
    没跑过就是未回；本小节内不进 eval 分母，所以只报事实、不代用户决定要不要回，更不许说成「已处理」
    （口径见步骤 5）
+   ⑮ report.json 的 `followupLedger`（#63 六键恒在：`collected` 本场采到 / `previous` 上一份 /
+   `missing` 上一份有本场没有 / `appeared` 本场新增 / `shape` 位置签名 / `followupCollection`
+   采集形态：接口回了几批各几条、前端下发了多少 id、并集剩几条）与终端 `[清单签名]` 行、`[done]`
+   行同段出现时呈报，并把**三个数字一起念**——它们互不相等就是缺陷信号（票面验收 5）。两个签名
+   的去向相反：`tail_truncated`（消失项是上一份末尾连续一段）＝我们这侧读数残缺，跌幅过半时脚本
+   沿用上一份、本场 eval 不吃这份数据；`scattered_lost`（消失项散在列表中间）＝站点侧移走了会话，
+   照常覆盖，**样本基数因此变小**，念 `sampleSize` 与回复率必须连着念它，别读成「回复率退化」
+   （同 ⑥ 的 #59 分母口径）；`unknown`＝没有可比基准，报「本场只建立、不比对」。趋势里新增的
+   `denominator{conversations,shape}` 与状态 `appended_decline`（样本数低于最新一条，仍然落盘）
+   就是同一件事在时序上的留痕，`eval --trend` 打出「已追加（样本数低于最新一条…）」时如实报。
 
 
 > 日上限阶梯（首日 20、每日随机 +2-5、40 封顶、±5 抖动）由脚本自动推进，**默认不用管**；
@@ -331,6 +359,9 @@
    `LIVE_REPLY_TIMEOUT`，默认值现取 `live_apply.REPLY_TIMEOUT_DEFAULT`，本文不抄）：这期间按
    「实时投递」步骤 2 下的「回复起草规范」往**这一场的会话目录**写 `reply_N.json`；不值得回就写
    `{"skip": true, "reason": …}`，原因会带进报告供裁量。
+   这一条链路复用投递那套 `wait_reply`，所以「陈旧草稿」那道来历核验同样在（#93 C）：终端报了那一行
+   ＝脚本判这份 `reply_N` 早于本条 `request_N`、已拒收继续等；入站没有补投台账，等不到就按
+   `agent_timeout` 计，不重试。
    发送成功的确认来自**重新读 wapi 会话列表**（`getGeekFriendList`，复用 `ChatFirstPlatform.followup`），
    不是读卡片末条：按 `encryptJobId` 唯一命中同一条，要求末条 `fromId` 是我方 userId、`lastMsg` 等于
    我们发的那句，且 `lastTS` 相对点开前前进。发送动作触发后，`outcomes[]` 恒带一对对照：

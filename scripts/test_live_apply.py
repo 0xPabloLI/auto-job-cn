@@ -46,6 +46,9 @@ from platforms import chat_first as chat_mod  # noqa: E402
 # #75 条目 B：收尾采集这条路径也要落水位线两键——用例按真实写入口造「上次基准」，不手搓形态。
 import _inbound_watermark as wm  # noqa: E402
 
+# #63 切片 B：签名读数、台账键集合与那句措辞都按生产函数取（夹具硬写键名会在改名时静默空过）。
+import _followup_shape as fshape  # noqa: E402
+
 # 最直接的自证：别名函数的 `__globals__` 必须就是 `fx` 的命名空间——patch 打在 `fx` 上，写者才读得到。
 # 将来若有人改用 spec-from-file 另加载一份 `_forensics`，这里当场红，而不是留一堆静默 no-op 的隔离。
 assert mod._touch_heartbeat.__globals__ is fx.__dict__, "取证模块必须是同一个对象"
@@ -265,6 +268,96 @@ def test_wait_reply_skip_flag(tmp_path):
     assert mod.wait_reply(tmp_path, 3, timeout=10, poll=1, sleep_fn=lambda s: None, now_fn=lambda: 0) == mod.SKIP, (
         "agent 判定不匹配（skip:true）立即返回 SKIP，不等超时"
     )
+
+
+# --- #93 C：新鲜度守卫——只接受「本岗 request 落盘之后」写下的 reply ---
+
+
+def _stamp(path, mtime):
+    """显式设定 mtime 造先后关系——不用 sleep：睡眠只拉长用例，且跨不了秒级粒度。"""
+    os.utime(path, (mtime, mtime))
+
+
+def test_wait_reply_rejects_stale_draft_and_takes_the_fresh_one(tmp_path, capsys):
+    """上一岗残留的 reply_N.json（mtime 早于本岗 request）不许被本岗消费——继续等到本岗草稿
+    出现才返回（调用方无感）；陈旧只首次发现时报一行，不逐拍刷屏。"""
+    reply = tmp_path / "reply_1.json"
+    reply.write_text(json.dumps({"send_text": "上一岗的草稿"}, ensure_ascii=False), encoding="utf-8")
+    _stamp(reply, 1000.0)
+    mod.request_greeting(tmp_path, 1, {"jobName": "本岗"}, "JD 全文")
+    _stamp(tmp_path / "request_1.json", 2000.0)
+    polls, clock = [], {"t": 0}
+
+    def agent_writes_fresh(s):
+        polls.append(1)
+        clock["t"] += s  # 时钟必须走：守卫若退化成「全拒」，本用例要靠超时退出变红，而不是挂住 CI
+        if len(polls) == 2:  # 第 2 拍本岗草稿才送达
+            reply.write_text(json.dumps({"send_text": "本岗的草稿"}, ensure_ascii=False), encoding="utf-8")
+            _stamp(reply, 3000.0)
+
+    text = mod.wait_reply(tmp_path, 1, timeout=60, poll=1, sleep_fn=agent_writes_fresh, now_fn=lambda: clock["t"])
+    assert text == "本岗的草稿", "陈旧草稿被拒后继续等，新鲜草稿照常消费"
+    out = capsys.readouterr().out
+    assert out.count("陈旧") == 1, f"陈旧只报一行（len(polls)={len(polls)}），实际输出：{out!r}"
+
+
+def test_wait_reply_guard_is_inert_without_request(tmp_path, capsys):
+    """request_N.json 不存在时守卫**失效不改判**：只写 reply 的调用方与脚本外的老会话目录
+    照旧按内容判定，也不许冒出陈旧播报。"""
+    reply = tmp_path / "reply_1.json"
+    reply.write_text(json.dumps({"send_text": "照旧可消费的草稿"}, ensure_ascii=False), encoding="utf-8")
+    _stamp(reply, 1000.0)  # 「远古」mtime：没有 request 就没有可比的下限
+    text = mod.wait_reply(tmp_path, 1, timeout=10, poll=1, sleep_fn=lambda s: None, now_fn=lambda: 0)
+    assert text == "照旧可消费的草稿"
+    assert "陈旧" not in capsys.readouterr().out, "守卫失效那一支不改变判定，也不产生新播报"
+
+
+def test_wait_reply_stale_skip_sentinel_is_rejected(tmp_path):
+    """SKIP 哨兵同样受守卫约束：上一岗的 {"skip": true} 残留不得让本岗直接跳岗——
+    那是「本岗没投」的另一种静默丢失，比误发还难事后发现。拒掉后本岗走既有超时口径。"""
+    reply = tmp_path / "reply_1.json"
+    reply.write_text(json.dumps({"skip": True, "reason": "上一岗的理由"}, ensure_ascii=False), encoding="utf-8")
+    _stamp(reply, 1000.0)
+    mod.request_greeting(tmp_path, 1, {"jobName": "本岗"}, "JD 全文")
+    _stamp(tmp_path / "request_1.json", 2000.0)
+    clock = {"t": 0}
+    text = mod.wait_reply(
+        tmp_path,
+        1,
+        timeout=10,
+        poll=3,
+        sleep_fn=lambda s: clock.__setitem__("t", clock["t"] + s),
+        now_fn=lambda: clock["t"],
+        grace=0,
+    )
+    assert text is None, "陈旧 SKIP 被拒 → 本岗按超时处理（agent_timeout 进补投），不冒充 agent 判定"
+
+
+def test_wait_reply_grace_pass_also_rejects_stale_draft(tmp_path, capsys):
+    """宽限复查那段（#55）同样过这道关：主轮询里只有陈旧草稿 → 照旧耗尽超时；
+    宽限窗口内本岗草稿送达 → 按「救回」消费，绝不退回拿那份陈旧的。"""
+    reply = tmp_path / "reply_0.json"
+    reply.write_text(json.dumps({"send_text": "上一岗的草稿"}, ensure_ascii=False), encoding="utf-8")
+    _stamp(reply, 1000.0)
+    mod.request_greeting(tmp_path, 0, {"jobName": "本岗"}, "JD 全文")
+    _stamp(tmp_path / "request_0.json", 2000.0)
+    clock = {"t": 0}
+    calls = {"n": 0}
+
+    def late_agent(s):
+        calls["n"] += 1
+        clock["t"] += s
+        if calls["n"] == 6:  # 主超时耗尽后（第 5 拍起进宽限轮询）、宽限期内送达本岗草稿
+            reply.write_text(json.dumps({"send_text": "本岗的迟到草稿"}, ensure_ascii=False), encoding="utf-8")
+            _stamp(reply, 3000.0)
+
+    text = mod.wait_reply(
+        tmp_path, 0, timeout=10, poll=3, sleep_fn=late_agent, now_fn=lambda: clock["t"], grace=60, grace_poll=5
+    )
+    assert text == "本岗的迟到草稿", "宽限救回的是本岗草稿，不是上一岗那份陈旧的"
+    out = capsys.readouterr().out
+    assert "救回" in out
+    assert out.count("陈旧") == 1, f"主轮询与宽限复查共用一条报线，实际输出：{out!r}"
 
 
 # --- 动作截图 ---
@@ -1180,6 +1273,216 @@ def test_edd_wrapup_zero_sample_after_nonzero_history_skips_snapshot(tmp_path, c
     term = capsys.readouterr().out
     assert "[EDD] 跳过趋势快照" in term and "## EDD 趋势跟踪" not in term, term
     assert len(paths["trend"].read_text(encoding="utf-8").splitlines()) == 1, "假零点进了趋势历史"
+
+
+def test_edd_wrapup_decline_is_appended_and_not_silent(tmp_path, capsys, monkeypatch):
+    """#63 验收 4 的收尾侧：`appended_decline` 是**已写盘**——走 `is_appended` 这一条问法（旧写法读
+    `trend_appended` 布尔，状态一多就会把这场读成「没写」并给它编一句未追加的谎）；渲染趋势块之外
+    再补一行点名「本场样本数低于趋势最新一条」。判序仍只在咽喉里：本用例只喂状态、不自比样本数。
+    `trend_history` 由 #82 规定必须由产生快照那一步喂进来（缺了就是「趋势块未渲染」那一支），
+    所以夹具按生产出口的形状带上它。"""
+    outcome = {
+        "trend_appended": True,
+        "trend_status": mod._edd.TREND_APPENDED_DECLINE,
+        "snapshot": {"ts": "2026-10-09T12:00:00", "sampleSize": 52, "repliedCount": 2, "overallRate": 0.04},
+        "review_due": {"due": False, "reasons": []},
+        "density_due": {"due": False, "threshold": 5, "groups": []},
+        "trend_history": [
+            {"ts": "2026-10-08T12:00:00", "sampleSize": 60, "repliedCount": 2, "overallRate": 0.033, "minTotal": 30}
+        ],
+    }
+    monkeypatch.setattr(mod.g, "record_session_snapshot", lambda p, profile, now=None: outcome)
+    got = mod.edd_wrapup(_edd_paths(tmp_path), profile="p", now="2026-10-09T12:00:00")
+    assert got is outcome
+    term = capsys.readouterr().out
+    assert "## EDD 趋势跟踪" in term, term
+    assert "样本数低于趋势最新一条" in term and "52" in term, term
+    assert "跳过趋势快照" not in term, term
+
+
+def test_edd_wrapup_plain_append_has_no_decline_line(tmp_path, capsys, monkeypatch):
+    """负对照（防把那句点名改成「每场都念」）：`appended` 只渲染趋势块，不多一行。
+    夹具自证：同一份 outcome 只换状态那一格，才会多出那一行。"""
+    base = {
+        "trend_appended": True,
+        "snapshot": {"ts": "2026-10-09T12:00:00", "sampleSize": 52, "repliedCount": 2, "overallRate": 0.04},
+        "review_due": {"due": False, "reasons": []},
+        "density_due": {"due": False, "threshold": 5, "groups": []},
+        # 同上一条：#82 起渲染吃生产出口交来的 append 前历史，夹具按同一形状喂
+        "trend_history": [
+            {"ts": "2026-10-08T12:00:00", "sampleSize": 60, "repliedCount": 2, "overallRate": 0.033, "minTotal": 30}
+        ],
+    }
+    monkeypatch.setattr(
+        mod.g, "record_session_snapshot", lambda p, profile, now=None: {**base, "trend_status": "appended"}
+    )
+    mod.edd_wrapup(_edd_paths(tmp_path), profile="p", now="2026-10-09T12:00:00")
+    assert "样本数低于趋势最新一条" not in capsys.readouterr().out
+    monkeypatch.setattr(
+        mod.g,
+        "record_session_snapshot",
+        lambda p, profile, now=None: {**base, "trend_status": mod._edd.TREND_APPENDED_DECLINE},
+    )
+    mod.edd_wrapup(_edd_paths(tmp_path), profile="p", now="2026-10-09T12:00:00")
+    assert "样本数低于趋势最新一条" in capsys.readouterr().out
+
+
+def test_edd_wrapup_written_question_is_the_status_not_the_bool(tmp_path, capsys, monkeypatch):
+    """接线证明：收尾分支读的是 `_edd.is_appended(trend_status)`——一份只有 `trend_appended=True`、
+    没有状态的降级 outcome 不再被当成已写盘（布尔只是随带字段，状态才是出处）。
+    `_density_outcome` 那类拒写桩两种键都没有，照旧走跳过行（既有用例守着）。"""
+    monkeypatch.setattr(
+        mod.g,
+        "record_session_snapshot",
+        lambda p, profile, now=None: {"trend_appended": True, "snapshot": {}, "review_due": {}, "density_due": {}},
+    )
+    mod.edd_wrapup(_edd_paths(tmp_path), profile="p", now="2026-10-09T12:00:00")
+    assert "跳过趋势快照" in capsys.readouterr().out
+
+
+def _edd_trend_paths(tmp_path, n_total, n_replied, history=None):
+    """会话收尾趋势块的输入夹具（#82）：预置 trend 历史 + 本场 eval 出 n_total 配对 / n_replied 回复。
+    配对走真实 `join_eval_records` 链（company × brandName），不合成 groups——本票的缺陷正长在
+    「写快照 → 再读趋势 → 渲染」这条接缝上，夹具必须走这条链。
+    `history=None` 表示**不动** trend 文件（连跑两场的用例要留着上一场真写进去的那条）。"""
+    paths = _edd_paths(tmp_path)
+    convs, greets = [], []
+    for i in range(n_total):
+        brand = f"趋势测试公司{i}"
+        replied = i < n_replied
+        convs.append(
+            {
+                "company": brand,
+                "summary": "聊聊吗" if replied else "[送达]",
+                "status": "hr_replied" if replied else "awaiting",
+                "appliedJob": "区块链工程师",
+            }
+        )
+        greets.append(
+            {
+                "encryptJobId": f"e{i}",
+                "jobName": "区块链工程师",
+                "brandName": brand,
+                "level": "高",
+                "addressee": "hr",
+                "greeting": f"我有7年经验，交付过DeFi协议{i}",
+            }
+        )
+    paths["followup"].write_text(json.dumps({"conversations": convs}, ensure_ascii=False), encoding="utf-8")
+    paths["greetings"].write_text(json.dumps(greets, ensure_ascii=False), encoding="utf-8")
+    paths["annotations"].write_text("{}", encoding="utf-8")
+    if history is not None:
+        paths["trend"].write_text(
+            "".join(json.dumps(item, ensure_ascii=False) + "\n" for item in history),
+            encoding="utf-8",
+        )
+    return paths
+
+
+def test_edd_wrapup_vs_previous_compares_the_pre_append_history(tmp_path, capsys, monkeypatch):
+    """#82 承重断言：渲染吃的必须是 **append 之前**那份历史。旧写法在 `record_session_snapshot`
+    写完快照后才 `load_trend`，于是 `trend[-1]` 就是本场快照自己 ⇒「vs 上次」恒为 +0，ts 打的
+    也是本场 ts（真机读数：2026-10-22 那场把 2026-10-22T05:38:11 打成了「vs 上次」，而真实上一条
+    是 2026-10-20T21:25:13 的 47/2）。历史 47/2 → 本场 50/4 ⇒ 票面验收 1 的三项读数（样本 +3 /
+    回复 +2 / 回复率 +3.7pp）逐项钉住——回复率那项走 `_fmt_pp`（百分点），另两项走 `:+d`。"""
+    monkeypatch.setattr(mod, "notify", lambda title, msg: None)
+    history = [
+        {
+            "ts": "2026-10-18T08:00:00",
+            "profile": "p",
+            "sampleSize": 40,
+            "repliedCount": 1,
+            "overallRate": 0.025,
+            "minTotal": 30,
+        },
+        {
+            "ts": "2026-10-20T21:25:13",
+            "profile": "p",
+            "sampleSize": 47,
+            "repliedCount": 2,
+            "overallRate": 2 / 47,
+            "minTotal": 30,
+        },
+    ]
+    paths = _edd_trend_paths(tmp_path, 50, 4, history)
+    outcome = mod.edd_wrapup(paths, profile="p", now="2026-10-22T05:38:11")
+    assert outcome["snapshot"]["ts"] == "2026-10-22T05:38:11"
+    term = capsys.readouterr().out
+    assert f"vs 上次（{outcome['snapshot']['ts']}）" not in term, f"「vs 上次」比的是本场自己：{term}"
+    assert "vs 上次（2026-10-20T21:25:13）：样本 +3 / 回复 +2 / 回复率 +3.7pp" in term, term
+    assert "vs baseline（2026-10-18T08:00:00）：样本 +10 / 回复 +3" in term, term
+    assert "trend_history" not in outcome, "一次性渲染输入不该进 report.json 的 edd 字段"
+
+
+def test_edd_wrapup_without_pre_append_history_renders_nothing(tmp_path, capsys, monkeypatch):
+    """#82：自称已追加却没带 `trend_history` 时，趋势块宁可不渲染也不回退成
+    「渲染侧自己 load_trend」——那正是本票修掉的写后读形态（vs 上次恒 +0）。
+    （合并 #63 时把桩里的「已写盘」从 `trend_appended` 布尔改成 `trend_status`：#63 起
+    「写没写盘」的唯一问法是 `_edd.is_appended(trend_status)`，只带布尔的那份 outcome 会被读成
+    「没写」而走跳过那支；本条要守的是**缺历史不渲染**，与用哪个键回答「写没写」是两件事。）"""
+    monkeypatch.setattr(
+        mod.g,
+        "record_session_snapshot",
+        lambda p, profile, now=None: {
+            "trend_appended": True,
+            "trend_status": mod._edd.TREND_APPENDED,
+            "snapshot": {},
+        },
+    )
+    outcome = mod.edd_wrapup(_edd_paths(tmp_path), profile="p", now="2026-09-17T10:00:00")
+    term = capsys.readouterr().out
+    assert "趋势块未渲染" in term and "## EDD 趋势跟踪" not in term, term
+    assert outcome == {"trend_appended": True, "trend_status": mod._edd.TREND_APPENDED, "snapshot": {}}
+
+
+def test_edd_wrapup_compares_against_a_same_ts_history_entry(tmp_path, capsys, monkeypatch):
+    """#82 禁法的正例（同 ts、不同内容）：`now` 由调用方传入，同一场会话里连收尾两次（或 eval 与
+    收尾同秒）就会造出「历史末条与 current 的 ts 相同、内容不同」——那条是**真实上一条**，增量必须
+    按它算：上一场 50/4 → 本场 51/5 ⇒ 样本 +1 / 回复 +1 / 回复率 +1.8pp（非零）。
+    「末条 ts 等于 current 就剔除」的兜底会把它当本场自己剔掉，previous 退到 47/2 那条（读数变成
+    样本 +4 / 回复 +3 / 回复率 +5.5pp），历史只剩一条时更直接塌成「baseline 记录于本条」——
+    那种兜底一进仓本条就红。
+    （md 侧只钉 ts 这一种：`render_trend_md` 唯一的生产调用方 `edd_wrapup` 只在**已追加**时才渲染，
+    而咽喉的幂等规则决定「已追加」时历史末条内容必不等于本场 ⇒ 「按内容相等剔除」在 md 侧没有可达
+    形态，它在 table 侧由 `test_cmd_eval_trend_table_keeps_the_duplicate_snapshot_as_previous` 钉住。）"""
+    monkeypatch.setattr(mod, "notify", lambda title, msg: None)
+    now = "2026-10-22T05:38:11"
+    history = [
+        {
+            "ts": "2026-10-18T08:00:00",
+            "profile": "p",
+            "sampleSize": 40,
+            "repliedCount": 1,
+            "overallRate": 0.025,
+            "minTotal": 30,
+        },
+        {
+            "ts": "2026-10-20T21:25:13",
+            "profile": "p",
+            "sampleSize": 47,
+            "repliedCount": 2,
+            "overallRate": 2 / 47,
+            "minTotal": 30,
+        },
+    ]
+    paths = _edd_trend_paths(tmp_path, 50, 4, history)
+    first = mod.edd_wrapup(paths, profile="p", now=now)
+    assert first["trend_appended"] is True and first["snapshot"]["ts"] == now, first
+    capsys.readouterr()
+
+    # 又采到一条回复后同场次再收尾一次：不碰 trend，上一场那条真快照就是本场历史末条（ts 与本场相同）
+    paths = _edd_trend_paths(tmp_path, 51, 5)
+    second = mod.edd_wrapup(paths, profile="p", now=now)
+    assert second["trend_appended"] is True, second
+    entries = [json.loads(line) for line in paths["trend"].read_text(encoding="utf-8").splitlines()]
+    assert len(entries) == 4, f"本场快照没入账：{entries}"
+    assert [e["ts"] for e in entries[-2:]] == [now, now], "夹具没造出「与历史末条同 ts」的形态"
+    assert entries[-2]["sampleSize"] != entries[-1]["sampleSize"], "夹具须同 ts 且不同内容"
+    term = capsys.readouterr().out
+    assert f"vs 上次（{now}）：样本 +1 / 回复 +1 / 回复率 +1.8pp" in term, term
+    assert "vs baseline（2026-10-18T08:00:00）：样本 +11 / 回复 +4 / 回复率 +7.3pp" in term, term
+    assert "vs 上次（2026-10-20T21:25:13）" not in term, f"previous 被剔成更早的一条：{term}"
+    assert "baseline 记录于本条" not in term, f"读数被剔成冷启动：{term}"
 
 
 # --- #45 密度阈值提示制：会话收尾通道（达标 → 提示块 + 候选清单 + 系统通知；低密度静默）---
@@ -2826,7 +3129,7 @@ def test_init_live_session_wires_collect_cfg(monkeypatch, tmp_path):
     monkeypatch.setattr(
         mod,
         "_open_session_dirs",
-        lambda base, vbase, record, ts: (tmp_path / "s", tmp_path / "shots", {}),
+        lambda base, ts: (tmp_path / "s", tmp_path / "shots"),
     )
     # #56 B1 起 `_init_live_session` 会读写楔死跳岗台账（private/data/wedge_skipped.json）：
     # 本用例与那条接线用例都必须把 private_path 钉到 tmp_path，否则测试会往真实 private/ 落文件
@@ -2876,7 +3179,7 @@ def test_reply_timeout_default_has_one_source(monkeypatch, tmp_path):
         ("get_platform", lambda: SimpleNamespace()),
         ("load_applied_ids", lambda path: set()),
         ("load_excluded_companies", lambda path: set()),
-        ("_open_session_dirs", lambda base, vbase, record, ts: (tmp_path / "s", tmp_path / "shots", {})),
+        ("_open_session_dirs", lambda base, ts: (tmp_path / "s", tmp_path / "shots")),
         (
             "session_banner",
             lambda queries, limit, limit_desc, applied_ids, excluded, session_dir, dry_run, recommend_desc="": None,
@@ -3087,9 +3390,7 @@ def _fake_run(tmp_path, cfg=None, queries=("AI",), limit=20):
         reported_path=tmp_path / "reported.json",  # #51：防重台账路径（这批用例不触达建票分支）
         browser_dir=tmp_path,
         video_base=tmp_path,
-        video_kwargs={},
         queries=list(queries),
-        record=False,
         limit=limit,
         applied_ids=set(),
         excluded=set(),
@@ -3329,9 +3630,11 @@ def test_build_report_source_is_null_when_unattributable():
 
 
 def test_build_report_separates_overlapping_retry_and_search_numbering():
-    """#61 验收 2 的实测坑：跨会话补投轮从 state["last_idx"] 起号、搜索流的 idx 从 0 起
-    （既有语义，本次不动），于是两段的编号区间**都是 1..N、会重叠**——只看 idx 会把台账里
-    投出的那封读成搜索流投出的。results 切片在同一场会话里严格递增，只有它能分开两者。"""
+    """#61 验收 2 的实测坑（守的是**归属不依赖编号唯一**）：补投轮与搜索流的编号区间若重叠
+    （这是 #93 A 之前的旧状态，A 后场内一号一岗、生产不再产生这种数据），只看 idx 会把台账里
+    投出的那封读成搜索流投出的，results 切片才能分开两者。
+    本用例喂的是**桩 spans/results**，所以它继续有效：判据退化或历史 report 回读时，它是唯一
+    还亮着的防线——别因为它「构造的是旧形态」而删掉。"""
     spans = [
         {"source": "retry", "query": None, "idx_from": 1, "idx_to": 2, "res_from": 0, "res_to": 2},
         {"source": "search", "query": "AI", "idx_from": 1, "idx_to": 2, "res_from": 2, "res_to": 4},
@@ -3339,7 +3642,7 @@ def test_build_report_separates_overlapping_retry_and_search_numbering():
     results = [
         {"idx": 1, "status": "applied"},
         {"idx": 2, "status": "applied"},
-        {"idx": 1, "status": "applied"},  # 搜索流与台账撞号
+        {"idx": 1, "status": "applied"},  # 桩数据里的重叠区间（#93 A 后生产不会再有）
         {"idx": 2, "status": "agent_skip", "reason": "hard_lang"},
     ]
     rep = mod.build_report(["AI"], {"applied": 3, "direct_fallback": 0, "source_spans": spans}, results)
@@ -3382,6 +3685,100 @@ def test_applied_by_source_is_self_consistent_with_per_entry_source(tmp_path, mo
     assert rep["applied_by_source"] == manual == {"search": 1, "recommend": 1, "retry": 1, "unknown": 0}
     assert sum(rep["applied_by_source"].values()) == rep["outcome_summary"]["applied"] == rep["applied"]
     assert [r["source"] for r in rep["results"]] == ["recommend", "search", None, "retry"]
+
+
+# --- #93：一场会话内 request_N / reply_N 的编号全场唯一，草稿归属才可判 ---
+
+
+def test_pending_retry_round_does_not_hand_its_draft_to_the_search_round(tmp_path, monkeypatch):
+    """链路级（#93）：跨会话补投轮把台账岗的招呼语**投出去了**，随后搜索轮拿到自己岗的 JD
+    起草——wait_reply 返回的那份必须属于本岗，不许是台账岗那份已被真人消费过的草稿。
+    真机形态见 private/data/live_session/20261022-135127/report.json（idx=1 两条：
+    applied/retry 与 no_jd/recommend，reply_1.json 就是已发出的那份）。
+    断言的是**内容归属**（草稿是谁家的），不是编号本身——编号只是让归属可判的手段。"""
+    run = _fake_run(tmp_path, {"live_recommend": False}, queries=("a",))
+    run.session.cfg["retry_pending_path"] = str(tmp_path / "retry_pending.json")
+    mod._save_retry_pending(
+        Path(run.session.cfg["retry_pending_path"]),
+        [mod._retry_snapshot(_timeout_job("jobA", name="台账岗A", brand="某司"), jd_text="")],
+    )
+
+    def apply_like_production(page, job, idx, session):
+        """投递内层循环替身：走**真实**的请求-等待链（request_N.json → wait_reply），
+        「agent」在首次轮询前按本岗岗位名写 reply_N.json，于是草稿归属读得出来。"""
+        name = job.get("jobName")
+        mod.request_greeting(session.session_dir, idx, job, f"JD：{name}")
+        reply = Path(session.session_dir) / f"reply_{idx}.json"
+
+        clock = {"t": 0}
+
+        def agent_writes(s):
+            clock["t"] += s  # 时钟必须走：守卫若退化，本用例要靠超时退出变红，而不是挂住 CI
+            reply.write_text(json.dumps({"send_text": f"{name} 的招呼语"}, ensure_ascii=False), encoding="utf-8")
+
+        text = mod.wait_reply(
+            session.session_dir, idx, timeout=60, poll=1, sleep_fn=agent_writes, now_fn=lambda: clock["t"]
+        )
+        session.state["applied"] += 1
+        session.results.append({"idx": idx, "job": name, "status": "applied", "send_text": text})
+        return None
+
+    monkeypatch.setattr(mod, "rnd_sleep", lambda *a, **k: None)
+    monkeypatch.setattr(mod, "_browse_list", lambda *a, **k: None)
+    monkeypatch.setattr(mod, "_pre_job_stop", lambda s, r: False)
+    monkeypatch.setattr(
+        mod,
+        "keyword_round",
+        _spy_keyword_round([], {"a": [{"encryptJobId": "e1", "jobName": "搜索岗B", "brandName": "某司"}]}),
+    )
+    monkeypatch.setattr(mod, "_apply_one_job", apply_like_production)
+    assert mod._retry_pending_jobs("P", run) is False
+    mod._execute_query_rounds(SimpleNamespace(), run)
+    drafts = {r["job"]: r["send_text"] for r in run.session.results}
+    assert drafts["台账岗A"] == "台账岗A 的招呼语"
+    assert drafts["搜索岗B"] == "搜索岗B 的招呼语", (
+        f"搜索岗B 拿到的是「{drafts['搜索岗B']}」——上一岗已发出的草稿被本岗当场消费（#93）"
+    )
+
+
+def test_session_idx_never_repeats_across_retry_and_search_rounds(tmp_path, monkeypatch):
+    """不变式（#93 A）：一场会话里**发过号的**结果条目编号互不相同。
+    判据按 `_span_covers` 的既有事实写——excluded_company / wedge_skipped / 起飞前自检这几类
+    条目**没有编号**（没有号就不参与撞号核对，不是撞号）。
+    用真实写入点造 results：跨会话补投轮跑完再跑搜索轮，正是撞号的那条生产路径。"""
+    run = _fake_run(tmp_path, {"live_recommend": True}, queries=("a",))
+    run.session.cfg["retry_pending_path"] = str(tmp_path / "retry_pending.json")
+    mod._save_retry_pending(
+        Path(run.session.cfg["retry_pending_path"]),
+        [
+            mod._retry_snapshot(_timeout_job("jobA", name="台账A", brand="某司"), jd_text=""),
+            mod._retry_snapshot(_timeout_job("jobB", name="台账B", brand="某司"), jd_text=""),
+        ],
+    )
+    fresh = [
+        {"encryptJobId": "r1", "jobName": "推1", "brandName": "某司"},
+        {"encryptJobId": "e1", "jobName": "搜1", "brandName": "某司"},
+        {"jobName": "排除岗", "brandName": "某基金"},  # 无编号条目，不参与撞号核对
+    ]
+
+    def spy_recommend_round(page, run, idx):
+        return mod._apply_fresh_jobs(page, run, [fresh[0]], idx)
+
+    run.excluded = {"某基金"}
+    monkeypatch.setattr(mod, "rnd_sleep", lambda *a, **k: None)
+    monkeypatch.setattr(mod, "_browse_list", lambda *a, **k: None)
+    monkeypatch.setattr(mod, "_pre_job_stop", lambda s, r: False)
+    monkeypatch.setattr(mod, "keyword_round", _spy_keyword_round([], {"a": fresh[1:]}))
+    monkeypatch.setattr(mod, "_recommend_round", spy_recommend_round)
+    monkeypatch.setattr(mod, "_apply_one_job", _record_applied_job)
+    assert mod._retry_pending_jobs("P", run) is False
+    mod._execute_query_rounds(SimpleNamespace(), run)
+    numbered = [(r["idx"], r["job"]) for r in run.session.results if isinstance(r.get("idx"), int)]
+    assert numbered == [(1, "台账A"), (2, "台账B"), (3, "推1"), (4, "搜1")], (
+        "补投轮 → 推荐轮 → 搜索轮连续续号，场内一号一岗"
+    )
+    idxs = [i for i, _ in numbered]
+    assert len(idxs) == len(set(idxs)), f"场内编号重复即撞号（#93）：{numbered}"
 
 
 # --- #32 段 2：招聘者活跃度字段旁听提取与透传 ---
@@ -3571,7 +3968,7 @@ def test_run_live_collects_fresh_followup_before_report():
     body = src.split("def run_live(")[1]
     collect = body.index("_collect_fresh_followup(run, page)")
     report = body.index("_write_session_report(run)")
-    hold = body.index("_hold_browser_until_closed(run.session)")
+    hold = body.index("_hold_browser_until_closed(")
     assert collect < report < hold, "顺序须为 采集 followup → 写报告（含 eval）→ 保持浏览器"
 
 
@@ -3615,19 +4012,31 @@ def test_collect_fresh_followup_feeds_edd_snapshot(tmp_path, capsys, monkeypatch
 # --- #59 残缺采集护栏：0 条才不覆盖 ⇒ 与上一份条数对比（首页截断是断崖，真衰减是渐进）---
 
 
+def _keyed_convs(keys, label):
+    """按会话键造会话条目（`encryptJobId` 是 `_inbound_watermark.session_keys` 认的键之一）。
+    夹具**必须带键**：签名判据靠键比对，无键条目只能记 `unkeyed` 不参与匹配，
+    一份全 null 键的上一份报告读出来是 `unknown`（没有可比条目），签名的两条形态都测不到。"""
+    return [{"encryptJobId": k, "company": f"{label}{k}"} for k in keys]
+
+
 def _prev_followup_report(path, n):
-    """上一份 followup 报告（残缺判定的基准）：n 条会话。"""
+    """上一份 followup 报告（残缺判定的基准）：n 条会话，键 `p0…p{n-1}`。
+    列表按**新→旧**排（#63 实物结论：两份列表都严格新→旧），所以「本场只剩前 k 条」这种
+    首页截断形态，落在上一份里的下标正好是连续尾部 `k…n-1` —— 夹具与真实形态同构。"""
     path.write_text(
-        json.dumps({"totalConversations": n, "conversations": [{"company": f"上次公司{i}"} for i in range(n)]}),
+        json.dumps({"totalConversations": n, "conversations": _keyed_convs([f"p{i}" for i in range(n)], "上次公司")}),
         encoding="utf-8",
     )
 
 
-def _collect_with(monkeypatch, run, n_conv, out):
-    """让 platform.followup 返回 n_conv 条会话并按既有接线跑一次收尾采集。"""
+def _collect_with(monkeypatch, run, n_conv, out, keys=None):
+    """让 platform.followup 返回 n_conv 条会话并按既有接线跑一次收尾采集。
+    默认取上一份的**前 n_conv 个键**（＝首页截断形态：新→旧列表的前缀保住、尾部整段掉）；
+    `keys` 显式给定时按给定键造条目（散落形态的夹具走这条）。"""
+    chosen = keys if keys is not None else [f"p{i}" for i in range(n_conv)]
     report = {
-        "totalConversations": n_conv,
-        "conversations": [{"company": f"本场公司{i}"} for i in range(n_conv)],
+        "totalConversations": len(chosen),
+        "conversations": _keyed_convs(chosen, "本场公司"),
     }
     monkeypatch.setattr(run.session.platform, "followup", lambda page, applied, **kw: report, raising=False)
     monkeypatch.setattr(mod.g, "resolve_paths", lambda env=None: {"followup": out})
@@ -3650,23 +4059,55 @@ def test_collect_fresh_followup_truncated_collection_keeps_previous(tmp_path, ca
 
 
 def test_collect_fresh_followup_gradual_decay_still_overwrites(tmp_path, capsys, monkeypatch):
-    """上一份 100、本场 60（≥一半）⇒ 照常覆盖：会话自然过期造成的真实衰减不能被误判成残缺，
-    否则新回复永远进不了 eval（正文否决 max(0.5×prev, prev−10) 的理由）。"""
+    """上一份 100、本场 60（跌幅未过半）⇒ 照常覆盖：真实衰减不能被误判成残缺，否则新回复永远
+    进不了 eval（正文否决 max(0.5×prev, prev−10) 的理由）。#63 切片 B 起这条腿还在，但**不再是
+    唯一一条**：形态腿（连续尾部）单独不构成否决。
+    「照常覆盖」现在等于「覆盖 + 当场点名」——旧断言只查 `"[warn]" not in`，那在新语义下弱于
+    实况（它确实打了一行签名读数），所以补上「打了什么」：不静默是票面验收 4 要的，不是可选噪音。"""
     run = _fresh_run(tmp_path, applied=[{"encryptJobId": "e1"}])
     out = tmp_path / "followup_report.json"
     _prev_followup_report(out, 100)
     report = _collect_with(monkeypatch, run, 60, out)
     assert json.loads(out.read_text(encoding="utf-8")) == report
     assert run.session.state["followup_fresh"] is True
-    assert "[warn]" not in capsys.readouterr().out
+    term = capsys.readouterr().out
+    assert "[warn]" not in term, term
+    assert "[清单签名]" in term and "tail_truncated" in term, term
+    assert "本场 60 条" in term and "上一份 100 条" in term and "消失 40 条" in term, term
+
+
+def test_collect_fresh_followup_scattered_cliff_still_overwrites(tmp_path, capsys, monkeypatch):
+    """#63 切片 B 的核心分歧（用户拍板按**位置签名**分流，否决原票面「跌幅超阈值就不覆盖」）：
+    上一份 100 条、本场 40 条——条数上是一条断崖（40×2 < 100，#59 那条纯比例腿会否决），
+    但缺的 60 条是**散落**的（本场保住的是偶数位 p0/p2/…/p78，奇数位一条不落，尾部 80…99 也没了）：
+    首个消失项在第 1 位而其后仍有 39 条保留 ⇒ 站点侧真实流失（10-21 实测：09-24 的 84 条里
+    63 条到 10-21 已从列表消失，保留项散到第 83 位），不是我们的首页截断。
+    这种形态**必须覆盖**——否决它只会把报告冻在旧名单上，新回复永远进不了 eval。
+    终端要当场点名三个数字与签名，不静默（票面验收 4）。"""
+    run = _fresh_run(tmp_path, applied=[{"encryptJobId": "e1"}])
+    out = tmp_path / "followup_report.json"
+    _prev_followup_report(out, 100)
+    scattered = [f"p{i}" for i in range(0, 80, 2)]  # 40 条，跳着取 ⇒ 缺失构成非连续的散落
+    assert len(scattered) * 2 < 100, "夹具须真的落在纯比例判据的否决区（否则本条没在测分歧）"
+    report = _collect_with(monkeypatch, run, len(scattered), out, keys=scattered)
+    assert json.loads(out.read_text(encoding="utf-8"))["conversations"] == report["conversations"], "散落流失被否决覆盖"
+    assert run.session.state["followup_fresh"] is True
+    term = capsys.readouterr().out
+    assert "40 条" in term and "100 条" in term and "60 条" in term, term
+    assert "scattered_lost" in term, term
 
 
 def test_collect_fresh_followup_overwrites_when_previous_unreadable(tmp_path, capsys, monkeypatch):
-    """上一份读不到 / 坏 JSON / conversations 非列表 ⇒ prev 视作 0，首次采集照常落盘。"""
-    for label, prep in (
-        ("missing", lambda p: None),
-        ("bad json", lambda p: p.write_text("not json", encoding="utf-8")),
-        ("not a list", lambda p: p.write_text(json.dumps({"conversations": {"a": 1}}), encoding="utf-8")),
+    """上一份读不到 / 坏 JSON / 列表形态不可比 ⇒ **没有可比基准**（不是「上一份 0 条」），
+    首次采集照常落盘。#63 切片 B 把这一格钉成读数而不是措辞：ledger 的 `previous` 必须是
+    `None`——把「读不出」写成 0 就是一条假的读数（本仓 `null ≠ 0`，#61/#65），双轴 review
+    用 `{conversations 非列表, totalConversations: 100}` 这个夹具复现出 100 / 0 / None 三个数。"""
+    for label, prep, want_prev in (
+        ("missing", lambda p: None, None),
+        ("bad json", lambda p: p.write_text("not json", encoding="utf-8"), None),
+        ("not a list", lambda p: p.write_text(json.dumps({"conversations": {"a": 1}}), encoding="utf-8"), None),
+        # 列表读不出、但总条数在：条数那一格要如实报 100，位置签名那一格仍是 unknown（不可比）
+        ("total only", lambda p: p.write_text(json.dumps({"totalConversations": 100}), encoding="utf-8"), 100),
     ):
         out = tmp_path / f"followup_report_{label.replace(' ', '_')}.json"
         prep(out)
@@ -3674,7 +4115,12 @@ def test_collect_fresh_followup_overwrites_when_previous_unreadable(tmp_path, ca
         report = _collect_with(monkeypatch, run, 3, out)
         assert json.loads(out.read_text(encoding="utf-8")) == report, f"prev={label} 时应覆盖"
         assert run.session.state["followup_fresh"] is True, label
-        assert "[warn]" not in capsys.readouterr().out, label
+        term = capsys.readouterr().out
+        assert "[warn]" not in term, label
+        ledger = run.session.state["followup_ledger"]
+        assert ledger["previous"] == want_prev, f"{label}：previous 读成了 {ledger['previous']!r}"
+        assert ledger["collected"] == 3, label
+        assert ledger["shape"] == "unknown", label
 
 
 def test_collect_fresh_followup_zero_conversations_unchanged(tmp_path, capsys, monkeypatch):
@@ -3688,6 +4134,95 @@ def test_collect_fresh_followup_zero_conversations_unchanged(tmp_path, capsys, m
     assert run.session.state["followup_fresh"] is False
     term = capsys.readouterr().out
     assert "采集到 0 条对话（疑似登录态过期/掉线）——沿用上次报告，不覆盖" in term, term
+
+
+# --- #63 切片 B4：签名台账进 report.json（恒在）+ 收尾 `[done]` 行只念非 stable ---
+
+
+def test_collect_fresh_followup_stashes_ledger_even_when_it_vetoes(tmp_path, monkeypatch):
+    """否决那一场同样要留台账——「掉了几条、掉在哪」正是不覆盖那一次需要回答的问题。
+    取数处是 state，落盘形状是 `build_report` 的 `followupLedger`；切片 A 的 `followupCollection`
+    **原样嵌入**（读数要有单一出处，不逐字段复制）。"""
+    run = _fresh_run(tmp_path, applied=[{"encryptJobId": "e1"}])
+    out = tmp_path / "followup_report.json"
+    _prev_followup_report(out, 100)
+    collection = {
+        "path": "wapi",
+        "batches": 1,
+        "batchSizes": [3],
+        "maxBatch": 3,
+        "requestedIds": 3,
+        "union": 3,
+        "unkeyed": 0,
+    }
+    report = {
+        "totalConversations": 3,
+        "followupCollection": collection,
+        "conversations": _keyed_convs([f"p{i}" for i in range(3)], "本场公司"),
+    }
+    monkeypatch.setattr(run.session.platform, "followup", lambda page, applied, **kw: report, raising=False)
+    monkeypatch.setattr(mod.g, "resolve_paths", lambda env=None: {"followup": out})
+    mod._collect_fresh_followup(run, page=None)
+    ledger = run.session.state["followup_ledger"]
+    assert set(ledger) == set(fshape.LEDGER_KEYS), ledger
+    assert ledger["shape"] == fshape.SHAPE_TAIL_TRUNCATED and ledger["collected"] == 3, ledger
+    assert ledger["previous"] == 100 and ledger["missing"] == 97 and ledger["appeared"] == 0, ledger
+    assert ledger["followupCollection"] == collection, "切片 A 的读数原样嵌入"
+    # 否决的这场没落盘，但 `[done]` 行与 report.json 都要读得到这场读数
+    assert run.session.state["followup_fresh"] is False
+    assert run.session.state["followup_shape"]["missingFrom"] == 3
+    assert json.loads(out.read_text(encoding="utf-8"))["totalConversations"] == 100
+
+
+def test_collect_fresh_followup_lands_ledger_into_the_written_report(tmp_path, monkeypatch):
+    """覆盖那一场：签名读数落进 `followup_report.json` 的 `followupLedger`——
+    这份报告是全量覆盖写的，不落这里就答不出「上一份的分母与签名」，
+    而趋势侧的 `denominator`（`_followup_shape.denominator`）只从这一个键取值。"""
+    run = _fresh_run(tmp_path, applied=[{"encryptJobId": "e1"}])
+    out = tmp_path / "followup_report.json"
+    _prev_followup_report(out, 10)
+    _collect_with(monkeypatch, run, 4, out, keys=[f"p{i}" for i in range(0, 8, 2)])
+    ledger = json.loads(out.read_text(encoding="utf-8"))["followupLedger"]
+    assert ledger["shape"] == fshape.SHAPE_SCATTERED_LOST and ledger["previous"] == 10, ledger
+    assert ledger["collected"] == 4 and ledger["missing"] == 6, ledger
+    assert ledger["followupCollection"] is None, "平台替身没给采集读数 ⇒ 落 None 不落空字典"
+
+
+def test_build_report_followup_ledger_is_always_present():
+    """恒在键契约（口径同 #62/#65/切片 A）：dry-run 与采集失败那两种「没有本场读数」的形态，
+    六个键照样都在、值为 `None`——报告读者不必防缺键，也不许把「没有读数」读成 0 条。"""
+    state = {"applied": 0, "direct_fallback": 0, "keyword_skips": [], "dry_run": True}
+    ledger = mod.build_report(["q"], state, [])["followupLedger"]
+    assert set(ledger) == set(fshape.LEDGER_KEYS), ledger
+    assert all(value is None for value in ledger.values()), ledger
+    filled = fshape.build_ledger(fshape.compare([], []), {"path": "dom"})
+    assert mod.build_report(["q"], {**state, "followup_ledger": filled}, [])["followupLedger"] == filled
+
+
+def test_write_session_report_done_line_names_signature_only_when_not_stable(tmp_path, monkeypatch, capsys):
+    """`[done]` 行的措辞**必须**调 `_followup_shape.phrase`（同一句话不许在 live_apply 再拼一遍，
+    #64/#75 都栽在两个 writer 各写一份）；stable 与「没有本场读数」两种都不打扰收尾行。"""
+    reading = fshape.compare(_keyed_convs([f"p{i}" for i in range(10)], "上"), _keyed_convs(["p0", "p2"], "本场"))
+    state = {"applied": 1, "direct_fallback": 0, "keyword_skips": [], "followup_shape": reading}
+    session, _ = _fake_session(tmp_path, state=state)
+    session.results.append({"idx": 1, "job": "岗", "status": "applied"})
+    monkeypatch.setattr(mod, "edd_wrapup", lambda paths, profile, now=None: {"trend_appended": False, "reason": "none"})
+    monkeypatch.setattr(mod.g, "resolve_paths", lambda env=None: {"name": "p"})
+    mod._write_session_report(SimpleNamespace(queries=["q"], env={}, session=session))
+    out = capsys.readouterr().out
+    assert fshape.phrase(reading) in out, out
+    assert fshape.SHAPE_SCATTERED_LOST in out, out
+
+    for label, over in (("stable", {"shape": fshape.SHAPE_STABLE}), ("无本场读数", {})):
+        state = {"applied": 1, "direct_fallback": 0, "keyword_skips": [], "followup_shape": over}
+        session, _ = _fake_session(tmp_path / label.replace(" ", "_"), state=state)
+        session.results.append({"idx": 1, "job": "岗", "status": "applied"})
+        monkeypatch.setattr(
+            mod, "edd_wrapup", lambda paths, profile, now=None: {"trend_appended": False, "reason": "none"}
+        )
+        monkeypatch.setattr(mod.g, "resolve_paths", lambda env=None: {"name": "p"})
+        mod._write_session_report(SimpleNamespace(queries=["q"], env={}, session=session))
+        assert "[done]" in capsys.readouterr().out and "签名" not in capsys.readouterr().out, label
 
 
 # --- 起飞前自检看门狗（20260925-215522 会话楔死实测：进程内 signal 不可靠，
@@ -4661,8 +5196,6 @@ def test_run_live_retry_round_wiring(tmp_path, monkeypatch):
         env={},
         ts="t",
         video_base=tmp_path,
-        video_kwargs={},
-        record=False,
         session=session,
         applied_ids=set(),
         excluded=set(),
@@ -4685,8 +5218,8 @@ def test_run_live_retry_round_wiring(tmp_path, monkeypatch):
         "_retry_session_jobs",
         "_collect_fresh_followup",
         "_write_session_report",
+        "_mark_session_done",
         "_hold_browser_until_closed",
-        "_finalize_recording",
     ):
         monkeypatch.setattr(mod, name, (lambda n: lambda *a, **k: order.append(n) or False)(name))
     assert mod.run_live({}) == 0
@@ -4696,9 +5229,37 @@ def test_run_live_retry_round_wiring(tmp_path, monkeypatch):
         "_retry_session_jobs",
         "_collect_fresh_followup",
         "_write_session_report",
+        "_mark_session_done",
         "_hold_browser_until_closed",
-        "_finalize_recording",
     ]
+
+
+def test_hold_browser_until_closed_waits_for_close_and_claims_no_video(tmp_path, monkeypatch, capsys):
+    """#105 删除录像链路后「结束不关窗（#39）」的最小行为钉：真 wait_close_sentinel 的两行
+    `[保持]` 措辞就钉在这里（#101 A1(a) 的措辞钉随录像用例删除，本用例等价接管——哨兵路径、
+    Ctrl+C 提示、「收到 CLOSE 信号」收尾行都不含录像/定格/剪辑字样）；notify 只报投递数并指向
+    CLOSE；Ctrl+C 分支保留（哨兵函数抛 KeyboardInterrupt 不外溢）。"""
+    run = SimpleNamespace(session=SimpleNamespace(state={"applied": 2}, session_dir=tmp_path))
+    notices = []
+    monkeypatch.setattr(mod, "notify", lambda title, body: notices.append(f"{title} {body}"))
+    (tmp_path / "CLOSE").write_text("", encoding="utf-8")  # 哨兵已在：真 wait_close_sentinel 立即返回
+    mod._hold_browser_until_closed(run)
+    out = capsys.readouterr().out
+    assert str(tmp_path / "CLOSE") in out, "等待的就是 session_dir/CLOSE 这个路径"
+    assert "[保持] 浏览器保持打开" in out and "Ctrl+C" in out, out
+    assert "[保持] 收到 CLOSE 信号" in out
+    assert "录像" not in out and "定格" not in out and "剪辑" not in out, "全程不出现任何录像读数行"
+    assert len(notices) == 1 and "投递 2 个" in notices[0] and "写 CLOSE 结束保持" in notices[0]
+    assert "录像" not in notices[0] and "定格" not in notices[0] and "剪辑" not in notices[0], (
+        "notify 只留一种文案，且不含任何录像字样"
+    )
+
+    def raise_interrupt(path, **kw):
+        assert path == tmp_path / "CLOSE"
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(mod, "wait_close_sentinel", raise_interrupt)
+    mod._hold_browser_until_closed(run, sleep_fn=lambda s: None)  # 不抛 = Ctrl+C 分支仍在
 
 
 def test_report_and_done_line_retry_stats(tmp_path, monkeypatch, capsys):
@@ -5190,8 +5751,10 @@ def test_run_live_watchdog_wiring_order():
     session_done 哨兵在报告写盘后落（早于 CLOSE 等待——用户节奏的等待不得在看门狗眼皮下停拍）。"""
     src = Path(mod.__file__).resolve().read_text(encoding="utf-8")
     assert src.index("_record_browser_pids(run.session)") < src.index("_arm_session_watchdog(run.session)")
-    assert src.index("_write_session_report(run)") < src.index("_mark_session_done(run.session)")
-    assert src.index("_mark_session_done(run.session)") < src.index("_hold_browser_until_closed(run.session)")
+    body = src.split("def run_live(")[1]  # 只钉 run_live 的接线（定义处也算进 src 会假负）
+    assert body.index("_write_session_report(run)") < body.index("_mark_session_done(run.session)")
+    # done 哨兵落定后就是等用户 CLOSE（用户节奏的等待不得在看门狗眼皮下停拍）
+    assert body.index("_mark_session_done(run.session)") < body.index("_hold_browser_until_closed(")
 
 
 def test_surface_prior_wedge_warns_with_marker(tmp_path, capsys):
@@ -5351,10 +5914,13 @@ class _ListenerPage(_SendPage):
             self.listeners.remove(handler)
 
 
-def _run_apply_on_page(tmp_path, monkeypatch, page, times=3, grab=None):
+def _run_apply_on_page(tmp_path, monkeypatch, page, times=3, grab=None, arm=None, state=None):
     """同一 page 上连跑 N 岗（A1 的「不随 N 增长」需要多岗同页才有意义）。
     grab 可注入 grab_detail 替身，用于观察「本岗进行中监听器仍在位」；
-    #56 A3 后 grab_detail 多了 beat_fn 形参，替身一律以 **kw 收下。"""
+    #56 A3 后 grab_detail 多了 beat_fn 形参，替身一律以 **kw 收下。
+    arm(monkeypatch, page, calls) 在 `_send_mocks` **之后**执行——兜底导航一类的替身是
+    `_send_mocks` 装的，用例早于它 monkeypatch 会被静默覆盖（#67 踩过一次）。
+    state 缺省自建；传入时由调用方读它（#67 的聚合计数落在 state 上）。"""
     calls = _send_mocks(
         monkeypatch,
         [SimpleNamespace() for _ in range(times)],
@@ -5362,9 +5928,16 @@ def _run_apply_on_page(tmp_path, monkeypatch, page, times=3, grab=None):
     )
     if grab is not None:
         monkeypatch.setattr(mod, "grab_detail", grab)
-    platform = SimpleNamespace(login_dialog_selector="#login-dialog", save_evidence=lambda p, tag, job=None: None)
+    if arm is not None:
+        arm(monkeypatch, page, calls)
+    platform = SimpleNamespace(
+        login_dialog_selector="#login-dialog",
+        save_evidence=lambda p, tag, job=None: calls["evidence"].append(tag),
+    )
     pacer = SimpleNamespace(wait_skip=lambda: None, wait_sent=lambda: None)
-    results, state = [], {"applied": 0, "direct_fallback": 0, "keyword_skips": []}
+    results = []
+    if state is None:
+        state = {"applied": 0, "direct_fallback": 0, "keyword_skips": []}
     job = {"jobName": "测试岗", "brandName": "测试公司", "encryptJobId": "e1"}
     for i in range(times):
         mod.apply_live(page, job, tmp_path, i + 1, tmp_path, {"paste_prob": 1.0}, pacer, platform, results, state)
@@ -6684,15 +7257,15 @@ def test_wedge_dump_switch_parsing(monkeypatch, raw, expected):
 
 def test_three_bool_env_switches_have_three_distinct_value_tables(monkeypatch, tmp_path, capsys):
     """#56 修复轮 F2（事实核对，`docs/conventions/fact-verification.md`）：A4 开关的旧 docstring
-    自称「口径照仓内 LIVE_RECORD / LIVE_PREFLIGHT」，逐字去读那两处后**其实是三套不同的表**。
+    自称「口径照仓内另两处布尔开关」，逐字去读那两处后**其实是三套不同的表**。
 
     **取值表的逐行对照只有一份真源**，在 `_limits.py` 的「布尔 env 开关」小节（#59 修复轮 R4-4：
     原先这张表在本模块、`_forensics`、`_wedge_ledger`、`live_apply` 两处与这条用例里各抄了一份，
     六处维护必然漂）——本用例不再复述它，只按**行为**钉：同一批取值喂给四个开关各自的真实调用点
-    （`_init_live_session` 出口的 `run.record` / `_preflight_click_check` 的自检是否跳过 /
+    （`_init_live_session` 装配处的 `cfg["live_recommend"]` / `_preflight_click_check` 的自检是否跳过 /
     `_wedge_dump_enabled()` / `_wedge_skip_enabled()`），逐行钉死期望方向，再钉「三条方向向量
     两两不同」。方向向量的每一格就是那张表的一行 × 一列，表漂了这里立刻红。
-    强度只升不降的三条依据：① 旧用例对 LIVE_RECORD **只有**源码断言、没有行为断言，现在两边都有；
+    强度只升不降的三条依据：① 旧用例对 LIVE_RECOMMEND **只有**源码断言、没有行为断言，现在两边都有；
     ② 源码断言只能证明「那行字还在」，证明不了方向（把 `!= "off"` 改成 `== "off"` 它照样绿），
     现在逐行方向都钉住了；③ 三条向量互不相同是显式断言，任何一张表漂到另一张表上立刻红，
     而 strip/lower 与「false/no 归哪一侧」这些差异点都在批内取过值。"""
@@ -6702,12 +7275,12 @@ def test_three_bool_env_switches_have_three_distinct_value_tables(monkeypatch, t
         def goto(self, *a, **kw):
             raise RuntimeError("不该被调用（本用例只探开关认哪些值）")
 
-    def record_direction(raw):
-        """LIVE_RECORD 走 `_init_live_session` 的出口（`run.record` 就是 `_open_session_dirs`
-        收到的第三个实参）——这是它在生产里的唯一读点，钉它才算钉住调用点。"""
+    def recommend_direction(raw):
+        """LIVE_RECOMMEND 走 `_init_live_session` 的装配出口（`cfg["live_recommend"]`，由
+        `_apply_collect_cfg` 写入）——这是它在生产里的唯一读点，钉它才算钉住调用点。"""
         _init_stubs(monkeypatch, tmp_path)
-        env = {} if raw is None else {"LIVE_RECORD": raw}
-        return mod._init_live_session(env).record
+        env = {} if raw is None else {"LIVE_RECOMMEND": raw}
+        return mod._init_live_session(env).session.cfg["live_recommend"]
 
     def preflight_runs_check(raw):
         monkeypatch.setenv("LIVE_PREFLIGHT", raw)
@@ -6723,14 +7296,16 @@ def test_three_bool_env_switches_have_three_distinct_value_tables(monkeypatch, t
         monkeypatch.setenv(mod.WEDGE_LEDGER_ENV, raw)
         return mod._wedge_skip_enabled()
 
-    record_vec = [record_direction(raw) for raw in value_batch]
+    recommend_vec = [recommend_direction(raw) for raw in value_batch]
     preflight_vec = [preflight_runs_check(raw) for raw in value_batch]
     dump_vec = [dump_direction(raw) for raw in value_batch]
     skip_vec = [skip_direction(raw) for raw in value_batch]
 
     # 逐行方向（True=开）。三张表的分界点全在批内：精确串族只有 "off"；四值族连 "OFF"/" off "
     # 都关；两值族关得掉大小写与空白，但 "false"/"no" 关不掉。
-    assert record_vec == [True, False, True, True, True, True, True, True, True], dict(zip(value_batch, record_vec))
+    assert recommend_vec == [True, False, True, True, True, True, True, True, True], dict(
+        zip(value_batch, recommend_vec)
+    )
     assert preflight_vec == [False, False, False, False, False, False, True, True, True], dict(
         zip(value_batch, preflight_vec)
     )
@@ -6738,12 +7313,12 @@ def test_three_bool_env_switches_have_three_distinct_value_tables(monkeypatch, t
     assert skip_vec == dump_vec, "A4 与 B1 共用同一张两值表（刻意如此，见 `_wedge_skip_enabled` docstring）"
 
     # 三条方向向量两两不同 = 「三套表」这件事本身。任何一张漂向另一张，这里立刻红。
-    assert record_vec != preflight_vec, "LIVE_RECORD 不是四值表：false/no/0/OFF 关不掉录屏"
-    assert record_vec != dump_vec, "LIVE_RECORD 不是两值表：0/OFF/blank 关不掉录屏"
+    assert recommend_vec != preflight_vec, "LIVE_RECOMMEND 不是四值表：false/no/0/OFF 关不掉推荐来源"
+    assert recommend_vec != dump_vec, "LIVE_RECOMMEND 不是两值表：0/OFF/blank 关不掉推荐来源"
     assert preflight_vec != dump_vec, "四值表与两值表差在 false/no（别照抄）"
 
-    # 未设置＝默认开：三个开关同侧（这一侧旧用例只有 dump/skip 两行，record 是新增覆盖）。
-    assert record_direction(None) is True
+    # 未设置＝默认开：三个开关同侧（这一侧旧用例只有 dump/skip 两行，recommend 是新增覆盖）。
+    assert recommend_direction(None) is True
     monkeypatch.delenv("LIVE_PREFLIGHT", raising=False)
     capsys.readouterr()
     mod._preflight_click_check(_BoomPage(), None)
@@ -7846,6 +8421,128 @@ def test_no_jd_produces_no_request_file_and_request_always_carries_a_body(tmp_pa
     assert req["jdText"] == "JD 全文：负责测试", "request_N.json 的 jdText 恒非空"
 
 
+# --- #94 验收 5：no_jd 落空时也存取证三件套（观测补一格）------------------------------
+#
+# 失败基线（改前实测，main 7ab9d0a）：`_acquire_and_draft_greeting` 的 no_jd 出口只落一条
+# `detail_empty_outcome` 机读事件 + 一行 `[跳过]`，**不留任何页面现场**。现场证据是场次
+# 20261022-135127 的那个岗——`report.json` 报 `jd_class=detail_no_response` / `dom_shape=zero_hits`，
+# 而矛盾只被同一时刻的 `after-read` 截图（右栏职位描述清晰在屏）人眼看出：那台机器上
+# crash 目录里没有这个岗的任何 HTML，事后无从复核读数是形态漂移还是真没内容。
+# 三件套本体（PNG + 完整 HTML + url.txt）与写盘诚实性已由 #43/#53 修好，本切片只把触发点
+# 扩到 no_jd——所以钉的是「这一格落了没落」与「落了不许反噬处置」，不复述 save_crash_evidence 的输出口径。
+
+
+def test_no_jd_lands_page_evidence_before_skip(tmp_path, monkeypatch):
+    """#94 验收 5 本体：JD 落空 → 跳过之前先存一份页面现场，标签用 no_jd 专属的
+    `live-no-jd-{idx}`（不挤进 `live-no-comm` / `live-no-input` / `live-no-send` 那几桶，
+    否则 crash 目录里读不出这个岗是**哪一段**落的空）。"""
+
+    def no_body(_page, container, **kw):
+        container["data"] = {"code": 0, "zpData": None}
+        return ""
+
+    results, calls = _run_apply_on_page(tmp_path, monkeypatch, _ListenerPage(_DETAIL_URL), times=1, grab=no_body)
+    assert [r["status"] for r in results] == ["no_jd"]
+    assert calls["evidence"] == ["live-no-jd-1"], "落空岗要留现场（票面第二半：观测补一格）"
+    assert not (tmp_path / "request_1.json").exists(), "存证不改变「拿不到正文就不产 request」这条 R2 语义"
+
+
+def test_no_jd_evidence_lands_the_three_pieces_named_by_the_job(tmp_path, monkeypatch):
+    """落盘本体（不是「调用过存证」这一层）：用**真的** `ChatFirstPlatform.save_evidence` →
+    `save_crash_evidence`，断言 crash 目录里真的出现 PNG + 完整 HTML + url.txt 三件，
+    且文件名同时带 `brandName` 与 `live-no-jd-{idx}`——`save_crash_evidence` 不传 job 时品牌位
+    退化成 `unknown`，crash 目录里几十个现场就认不出是哪个岗（本切片的用处恰在能对上号）。
+    替身补齐三件套真正吃的三个面（`screenshot(path=…)` / `content()` / `url`），形状照
+    test_platforms._CrashPage，不放宽（#63 的教训：替身形状与生产不一致时，用例绿而生产崩）。"""
+    crash_dir = tmp_path / "crash"
+    monkeypatch.setattr(chat_mod, "CRASH_DIR", crash_dir)
+
+    class _EvidencePage(_ListenerPage):
+        def screenshot(self, **kw):
+            Path(kw["path"]).write_bytes(b"png-bytes")
+
+        def content(self):
+            return "<html><body>右栏职位描述 1-5 条清晰在屏</body></html>"
+
+    ctx = mod.LiveSessionContext(
+        session_dir=tmp_path,
+        shots_dir=tmp_path / "shots",
+        cfg={"paste_prob": 1.0},
+        pacer=SimpleNamespace(wait_skip=lambda: None, wait_sent=lambda: None),
+        platform=chat_mod.ChatFirstPlatform(),
+        results=[],
+        state={"applied": 0, "direct_fallback": 0, "keyword_skips": []},
+    )
+    job = {"jobName": "测试岗", "brandName": "测试公司", "encryptJobId": "e1"}
+
+    def no_body(_page, container, **kw):
+        container["data"] = {"code": 0, "zpData": None}
+        return ""
+
+    monkeypatch.setattr(mod, "grab_detail", no_body)
+    monkeypatch.setattr(mod, "shot", lambda *a, **k: None)
+    monkeypatch.setattr(mod, "safe_go_back", lambda page: None)
+    flow = mod._JobFlow(page=_EvidencePage(_DETAIL_URL), job=job, idx=7, ctx=ctx)
+    assert mod._acquire_and_draft_greeting(flow) == "next"
+    landed = sorted(p.name for p in crash_dir.iterdir())
+    assert len(landed) == 3, f"三件套应齐落，实得 {landed}"
+    for ext in (".png", ".html", ".url.txt"):
+        assert any(name.endswith(ext) for name in landed), f"{ext} 未落盘"
+    assert all("测试公司" in name and "live-no-jd-7" in name for name in landed), landed
+    assert [r["status"] for r in ctx.results] == ["no_jd"], "存证排在跳过之前，不改本岗处置"
+
+
+def test_no_jd_evidence_write_failure_does_not_change_disposition(tmp_path, monkeypatch, capsys):
+    """取证不得反噬投递（票面三条纪律之一）：这里把落盘本身弄坏——`CRASH_DIR` 指到一个
+    **普通文件**下面，`mkdir(parents=True)` 当场失败，这是三件套最外层的失败形态。
+    本岗照旧落 `no_jd`、归因读数一字不动；会话目录里也不许留下取证三件套的任何一件——
+    `tmp_path` 递归下不得出现 `.png` / `.html` / `.url.txt`（#43/#53 诚实性同口径）。"""
+    blocker = tmp_path / "blocked"
+    blocker.write_text("占位：让它下面建不出目录", encoding="utf-8")
+    monkeypatch.setattr(chat_mod, "CRASH_DIR", blocker / "crash")
+    ctx = mod.LiveSessionContext(
+        session_dir=tmp_path,
+        shots_dir=tmp_path / "shots",
+        cfg={"paste_prob": 1.0},
+        pacer=SimpleNamespace(wait_skip=lambda: None, wait_sent=lambda: None),
+        platform=chat_mod.ChatFirstPlatform(),
+        results=[],
+        state={"applied": 0, "direct_fallback": 0, "keyword_skips": []},
+    )
+    job = {"jobName": "测试岗", "brandName": "测试公司", "encryptJobId": "e1"}
+
+    def no_body(_page, container, **kw):
+        container["data"] = None
+        container["empty_outcome"] = {"hit_total": 0, "nonempty_total": 0, "seconds": 20.0}
+        return ""
+
+    monkeypatch.setattr(mod, "grab_detail", no_body)
+    monkeypatch.setattr(mod, "shot", lambda *a, **k: None)
+    monkeypatch.setattr(mod, "safe_go_back", lambda page: None)
+    flow = mod._JobFlow(page=_ListenerPage(_DETAIL_URL), job=job, idx=7, ctx=ctx)
+    assert mod._acquire_and_draft_greeting(flow) == "next", "存档失败不许把本岗变成 page_error"
+    assert [r["status"] for r in ctx.results] == ["no_jd"]
+    assert ctx.results[0]["jd_class"] == mod.NO_JD_NO_RESPONSE, "归因读数不因取证分支而变"
+    assert not (blocker / "crash").exists(), "mkdir 失败时不许建出半个 crash 目录"
+    # 真断言（不是「tmp_path 非空」那种恒真话）：三件套的任何一件都不许出现在会话目录里——
+    # 建目录失败后生产仍然逐件 try 写盘，任何一件落下来都是「凭空多出的现场」。
+    pieces = sorted(
+        str(p.relative_to(tmp_path))
+        for p in tmp_path.rglob("*")
+        if p.suffix in (".png", ".html") or p.name.endswith(".url.txt")
+    )
+    assert pieces == [], f"存档失败后会话目录里多出取证文件：{pieces}"
+    assert "存档失败" in capsys.readouterr().out, "由 save_crash_evidence 自己如实播报，这里不复述"
+
+
+def test_applied_path_lands_no_crash_evidence(tmp_path, monkeypatch):
+    """负对照：投出去的那一岗不许顺手存 crash 现场——本切片只把触发点扩到 no_jd，
+    正常路径多存一份完整 HTML 会把 crash 目录变成投递流水副本（也稀释真正要看的落空现场）。"""
+    results, calls = _run_apply_on_page(tmp_path, monkeypatch, _ListenerPage(_DETAIL_URL), times=1)
+    assert [r["status"] for r in results] == ["applied"]
+    assert calls["evidence"] == [], "成功路径零存证（既有行为，本切片不扩）"
+
+
 def test_no_jd_dom_shape_reads_the_dom_side_evidence():
     """修复轮 F1 的判别力本体：`grab_detail` 的选择器命中探测结果过去**只进事件、从不参与归因**，
     于是「往返没回 + DOM 选择器全落空」（票面的头号形态漂移嫌疑）被折进「超时未回＝站点抖动」，
@@ -8665,7 +9362,7 @@ def test_wedge_skip_enabled_default_on(monkeypatch, raw, expected):
 
 @pytest.mark.parametrize("raw", ["0", "off", "OFF", "  off  "])
 def test_wedge_skip_enabled_only_recognised_values_close(monkeypatch, raw):
-    """关只认 0 / off（去空白、大小写不敏感），口径照仓内既有开关（LIVE_RECORD / A4 的 _wedge_dump_enabled）。"""
+    """关只认 0 / off（去空白、大小写不敏感），口径照 A4 的 `_wedge_dump_enabled`（同一张两值表）。"""
     monkeypatch.setenv("LIVE_WEDGE_SKIP", raw)
     assert mod._wedge_skip_enabled() is False
 
@@ -9107,7 +9804,7 @@ def _init_stubs(monkeypatch, tmp_path, profile=("blockchain", "")):
     monkeypatch.setattr(mod, "get_platform", lambda: SimpleNamespace())
     monkeypatch.setattr(mod, "load_applied_ids", lambda path: set())
     monkeypatch.setattr(mod, "load_excluded_companies", lambda path: set())
-    monkeypatch.setattr(mod, "_open_session_dirs", lambda b, v, r, ts: (tmp_path / "s", tmp_path / "shots", {}))
+    monkeypatch.setattr(mod, "_open_session_dirs", lambda b, ts: (tmp_path / "s", tmp_path / "shots"))
 
     def fake_private_path(rel, prefix=""):
         p = Path(rel)
@@ -9923,3 +10620,274 @@ def test_build_report_carries_no_send_reasons():
     rows = [{"status": "no_send", "reason": "off_chat"}, {"status": "no_send", "reason": "send_click_failed"}]
     got = mod.build_report(["q"], state, rows)["no_send_reasons"]
     assert got["off_chat"] == 1 and got["send_click_failed"] == 1 and got["send_btn_missing"] == 0
+
+
+# --- #67：no_jd 本场重进详情一次（把可救的岗救回来，不等下一场）---------------------------
+#
+# 失败基线（改前实测，代码状态 ec29b76）：10-20 现场形态（场次 20261020-153733：落空时刻人在
+# 列表页 `/web/geek/jobs`、DOM zero_hits、详情接口整场没回）下 `_acquire_and_draft_greeting`
+# 只跑一次 `grab_detail` 就 `return _skip_job(flow, "no_jd", ...)`——
+#   ① 一次补导航都没有（`open_standalone_detail` 零调用）、抓取只落空一遍（命中探测一次）；
+#   ② no_jd 结果条目里没有 `reentered` / `jd_chars` 两键；
+#   ③ report.json 没有 `no_jd_reentries` 聚合键（零重进的场次也该打出 0）。
+# 下面每条用例断言的都是这三处**今天落不下来**的东西。判据按 2026-10-22 拍板 ① 用形态无关的
+# `on_job_detail`，不用「落空时刻 URL 不含 job_detail」这个已被 #41 证伪的单指标。
+
+_SCENE_LIST_URL = "https://www.zhipin.com/web/geek/jobs"  # no_jd_empty_urls 当场记下的那条 URL
+_SCENE_SPLIT_URL = "https://www.zhipin.com/web/geek/jobs?query=%E5%8C%96%E5%AD%A6%E5%B7%A5%E7%A8%8B%E5%B8%88"
+
+
+class _ReentryClock:
+    """假时钟（替换 `chat_mod` 命名空间里的 `time` 这个名字，形态同 test_platforms._FakeClock）：
+    `time()` 每次前进 step 秒 ⇒ 真 `grab_detail` 的 5s DOM 轮询与 15s XHR 空等**仍按判据跑完**
+    （容器里落盘的轮数与真实 evaluate 次数对得上），但不烧墙钟。"""
+
+    def __init__(self, start=0.0, step=0.0):
+        self.now = start
+        self.step = step
+        self.slept = []
+
+    def time(self):
+        v = self.now
+        self.now += self.step
+        return v
+
+    def sleep(self, seconds):
+        self.slept.append(seconds)
+
+
+class _ReentryPage(_ListenerPage):
+    """#67 现场替身：列表页 URL（不含 job_detail）+ 右栏无标题 + JD 选择器零命中 + 容器 `data`
+    恒 None（详情接口整场没回）。三段 JS 按内容分派（同 test_platforms._JdPage 那一招：右栏标题
+    JS 认 `getBoundingClientRect`、命中探测 JS 认 `querySelectorAll`、其余是 DOM 轮询），于是
+    **真的** `boss.grab_detail` 能在上面跑完两段轮询并亲自落 `empty_outcome`——归因读数是平台层
+    写出来的，不是用例手搓的。
+    重进的效果由 `_send_mocks` 的兜底替身完成（它把 URL 挪到 `/job_detail/{eid}.html`，与真实
+    `page.goto` 一致），本替身据此换形态：
+    - `jd_after_reentry`：换形态后 DOM 才渲染出正文（＝「重进就拿得到」那批可救的岗）；
+    - `stale_response`：首抓轮询期间站点自己发的那次 detail.json，由**生产监听器**写进容器
+      （第二次导航不再发 ⇒ 容器里只剩这份首抓已判空的残留）；
+    - `new_response`：换形态**之后**才到的那次 detail.json（真响应，不是残留）⇒ 这才算救回。"""
+
+    def __init__(self, url, panel_title="", jd_after_reentry="", stale_response=None, new_response=None):
+        super().__init__(url, panel_title)
+        self.jd_after_reentry = jd_after_reentry
+        self.stale_response = stale_response
+        self.new_response = new_response
+        self.poll_calls = 0
+        self.probe_calls = 0
+        self.waits = []
+
+    @property
+    def _on_standalone(self):
+        return "job_detail" in (self.url or "")
+
+    def fire(self, resp):
+        """把一次响应交给本岗挂着的 detail.json 监听器（真站点的响应就是这么进容器的）。"""
+        for handler in list(self.listeners):
+            handler(resp)
+
+    def evaluate(self, js, *args):
+        if "getBoundingClientRect" in js:  # PANEL_TITLE_JS（分栏视图右栏标题）
+            return self.panel_title
+        if "querySelectorAll" in js:  # _DETAIL_PROBE_JS（grab_detail 失败出口的命中探测）
+            self.probe_calls += 1
+            return [{"selector": ".job-sec-text", "hits": 0, "nonempty": 0}]
+        self.poll_calls += 1  # grab_detail 的 DOM 轮询
+        if self.stale_response is not None:
+            self.fire(self.stale_response)
+            self.stale_response = None  # 只此一次：重进那一次没有新的 detail.json
+        elif self.new_response is not None and self._on_standalone:
+            self.fire(self.new_response)
+            self.new_response = None
+        return self.jd_after_reentry if self._on_standalone else ""
+
+    def wait_for_timeout(self, ms):
+        self.waits.append(ms)
+
+
+def _run_reentry_job(tmp_path, monkeypatch, page, times=1, grab=None, arm=None):
+    """#67 各用例的入口 = `_run_apply_on_page`（真 `apply_live` 全链路 + 发送段桩；`arm` 与可传入
+    `state` 两个钩子已并回那条共用路径，不另抄一份）+ 把 `state` 一并交出来：本场重进的三个计数
+    落在 state 上、由 `build_report` 读出，只看 results 证不了它落盘。
+    `grab` 一律显式给：`_send_mocks` 会桩掉 `grab_detail`，缺省必须指回**真的** `boss.grab_detail`
+    ——现场归因读数（`empty_outcome` 那三条）要由平台层亲自写出来，不能是替身手搓的。"""
+    state = {"applied": 0, "direct_fallback": 0, "keyword_skips": []}
+    results, calls = _run_apply_on_page(
+        tmp_path, monkeypatch, page, times=times, grab=grab or chat_mod.grab_detail, arm=arm, state=state
+    )
+    return results, calls, state
+
+
+def test_no_jd_reenters_detail_once_when_bounced_to_list(tmp_path, monkeypatch):
+    """#67 验收 1（RED 本体）：落空时刻人已弹回列表（票面现场形态）⇒ 本场重进本岗详情一次再抓。
+    改前红在三处：`open_standalone_detail` 零调用、命中探测只跑一遍、条目里没有 reentered。"""
+    monkeypatch.setattr(chat_mod, "time", _ReentryClock(step=1.0))
+    page = _ReentryPage(_SCENE_LIST_URL)
+    results, calls, state = _run_reentry_job(tmp_path, monkeypatch, page)
+    assert [r["status"] for r in results] == ["no_jd"]
+    assert calls["standalone"] == ["e1"], "不在本岗详情 ⇒ 走 #41 的直跳通道重进**本岗**，不是别岗"
+    assert page.probe_calls == 2, "重进后又抓了一遍（每遍落空出口各探一次命中）"
+    assert results[0]["reentered"] is True
+    assert results[0]["jd_chars"] == 0, "第二遍仍没正文 ⇒ 读数如实报 0，不许冒充救回"
+    assert mod.build_report(["q"], state, results)["no_jd_reentries"] == {
+        "reentered": 1,
+        "recovered": 0,
+        "still_no_jd": 1,
+    }
+
+
+def test_no_jd_reentry_capped_at_one_per_job(tmp_path, monkeypatch):
+    """#67 验收 3（封顶 1 次/岗）：兜底导航**不改变形态**（替身只记次数、不挪 URL），
+    于是触发条件在重进之后依然成立——实现若写成「不在详情就一直重进」，这里会露出第 2 次导航
+    与第 3 次抓取（#41 的成环教训）。"""
+    monkeypatch.setattr(chat_mod, "time", _ReentryClock(step=1.0))
+    page = _ReentryPage(_SCENE_LIST_URL)
+    gotos = []
+
+    def _arm(mp, _page, _calls):
+        mp.setattr(mod, "open_standalone_detail", lambda _p, eid: gotos.append(eid))
+
+    results, _calls, _state = _run_reentry_job(tmp_path, monkeypatch, page, arm=_arm)
+    assert gotos == ["e1"], "一场里同一个岗最多一次重进"
+    assert page.probe_calls == 2, "抓取次数 = 首抓 + 重进后那一次，绝不第三次"
+    assert results[0]["reentered"] is True and results[0]["jd_chars"] == 0
+
+
+def test_no_jd_in_split_panel_with_this_job_never_reenters(tmp_path, monkeypatch):
+    """#67 验收 2 + 判据负对照（本票最大的回归风险）：分栏视图 `/web/geek/jobs?query=…` 的 URL
+    **本来就不含 job_detail**，右栏承载本岗时 `on_job_detail` 为真 ⇒ 零重进、零额外导航。
+    判据若被换回「落空时刻 URL 不含 job_detail」，本用例当场红——会多出一次导航，把右栏连同
+    「立即沟通」按钮一起毁掉（09-23 三例 no_btn 的根因，live_apply 那段注释明记过）。"""
+    monkeypatch.setattr(chat_mod, "time", _ReentryClock(step=1.0))
+    page = _ReentryPage(_SCENE_SPLIT_URL, panel_title="测试岗 30-50K 上海 经验不限 本科")
+    assert "job_detail" not in page.url, "本用例的形态正是 URL 判据恒真的那个陷阱"
+    assert mod.on_job_detail(page, "e1", "测试岗") is True, "拍板 ① 用的是这条形态无关判据"
+    results, calls, state = _run_reentry_job(tmp_path, monkeypatch, page)
+    assert calls["standalone"] == [], "已在详情（两种形态之一）⇒ 什么都不做，零额外导航"
+    assert page.probe_calls == 1, "没重进就没有第二次抓取"
+    assert results[0]["reentered"] is False and results[0]["jd_chars"] == 0
+    assert mod.build_report(["q"], state, results)["no_jd_reentries"] == {
+        "reentered": 0,
+        "recovered": 0,
+        "still_no_jd": 0,
+    }, "读数恒在：条目写 false/0，聚合键写 0"
+
+
+def test_no_jd_reentry_rescues_the_job_and_drafts_from_the_fresh_body(tmp_path, monkeypatch):
+    """本票的目标是「把可救的岗救回来」而不是把 no_jd 读数压低：重进换形态后正文出现 ⇒
+    本岗正常产 request 并投出，聚合键记 reentered=1 / recovered=1 / still_no_jd=0。"""
+    monkeypatch.setattr(chat_mod, "time", _ReentryClock(step=1.0))
+    page = _ReentryPage(_SCENE_LIST_URL, jd_after_reentry="JD 全文：负责合约审计与形式化验证（重进后才渲染）")
+    results, calls, state = _run_reentry_job(tmp_path, monkeypatch, page)
+    assert calls["standalone"] == ["e1"], "先重进才有救——导航走的是 #41 收敛后的直跳通道"
+    assert [r["status"] for r in results] == ["applied"], "救回来的岗要投出去，不是换个说法跳过"
+    req = json.loads((tmp_path / "request_1.json").read_text(encoding="utf-8"))
+    assert req["jdText"].startswith("JD 全文：负责合约审计"), "起草吃的是重进后拿到的那份正文"
+    assert mod.build_report(["q"], state, results)["no_jd_reentries"] == {
+        "reentered": 1,
+        "recovered": 1,
+        "still_no_jd": 0,
+    }
+
+
+def test_no_jd_attribution_after_reentry_reflects_the_last_attempt(tmp_path, monkeypatch):
+    """拍板 ⑤ / 后果 (a)：重进之后仍落空，归因与补投口径要按**最后一次**尝试成立，不许被救回率盖掉。
+    这条由真平台层跑出来：重进把 URL 挪到 `/job_detail/e1.html`，第二次落空时
+    `_record_empty_detail` 覆盖容器里的 `empty_outcome`（带新 url 与新时刻）⇒
+    「详情接口整场没回 + 此刻已在详情页」就是 #56 说的往返失败 / IP 级那一支，照旧**保留补投**。"""
+    monkeypatch.setattr(chat_mod, "time", _ReentryClock(step=1.0))
+    page = _ReentryPage(_SCENE_LIST_URL)
+    results, _calls, state = _run_reentry_job(tmp_path, monkeypatch, page)
+    entry = results[0]
+    assert entry["reentered"] is True
+    assert "job_detail/e1" in entry["empty_url"], f"落空读数要跟着最后一次尝试走（实得 {entry['empty_url']!r}）"
+    assert entry["jd_class"] == mod.NO_JD_NO_RESPONSE, "⑤：这一支的归因不许因为重进而改变"
+    assert entry["dom_shape"] == mod.DOM_SHAPE_ZERO_HITS
+    assert mod.apply_retry_outcome({"attempts": 0}, "no_jd", jd_class=entry["jd_class"])[0] is True, "仍保留补投"
+    assert mod.build_report(["q"], state, results)["no_jd_classes"][mod.NO_JD_NO_RESPONSE] == 1
+
+
+def test_no_jd_both_empty_still_leaves_the_retry_queue_after_reentry(tmp_path, monkeypatch):
+    """同一处判据的另一侧（拍板 ⑤）：重进后接口回了 code=0 而两侧都没有正文 ⇒ 归因仍是「双空」，
+    仍按 #56 移出补投台账——岗位无内容不是本票的靶子，`reentered=true` 不构成把它捞回的理由。"""
+    rounds = {"n": 0}
+
+    def grab_second_round_bodyless(page_, container, **kw):
+        rounds["n"] += 1
+        container["empty_outcome"] = {"at": "t", "hit_total": 0, "nonempty_total": 0, "url": page_.url}
+        if rounds["n"] > 1:
+            container["data"] = {"code": 0, "zpData": None}  # 重进后响应到了，但确实没有正文
+        return ""
+
+    results, calls, state = _run_reentry_job(
+        tmp_path, monkeypatch, _ReentryPage(_SCENE_LIST_URL), grab=grab_second_round_bodyless
+    )
+    entry = results[0]
+    assert calls["standalone"] == ["e1"] and rounds["n"] == 2
+    assert entry["jd_class"] == mod.NO_JD_BOTH_EMPTY and entry["reentered"] is True and entry["jd_chars"] == 0
+    assert mod.apply_retry_outcome({"attempts": 0}, "no_jd", jd_class=entry["jd_class"])[0] is False, "仍移出补投"
+    assert mod.build_report(["q"], state, results)["no_jd_classes"][mod.NO_JD_BOTH_EMPTY] == 1
+
+
+def test_no_jd_reentry_never_reads_stale_container_data_as_a_rescue(tmp_path, monkeypatch):
+    """后果 (b)：第二次导航若没有**新的** detail.json 回来，`grab_detail` 的 XHR 空等一看到容器
+    `data` 非 None 就立刻收工，读到的是首抓已经判空的那份残留。真实现的结构性保证是「首抓若能从
+    这份 data 取出正文就不会重进」，所以救回只可能来自新响应或重进后的新 DOM——两个方向各钉一条：
+    ① 残留形态：容器里只有首抓那份 code=0 无正文响应 ⇒ 仍落 no_jd、`reentered=true` 而 `jd_chars=0`，
+      且不产 request（不许把残留读成救回）；
+    ② 新响应形态：重进之后监听器才收到带正文的响应 ⇒ 才算救回。"""
+    monkeypatch.setattr(chat_mod, "time", _ReentryClock(step=1.0))
+    stale = _OkResp(f"https://www.zhipin.com{_DETAIL_FRAG}", {"code": 0, "zpData": None})
+    page = _ReentryPage(_SCENE_LIST_URL, stale_response=stale)
+    results, calls, state = _run_reentry_job(tmp_path, monkeypatch, page)
+    entry = results[0]
+    assert calls["standalone"] == ["e1"] and entry["reentered"] is True
+    assert entry["status"] == "no_jd" and entry["jd_chars"] == 0
+    assert not (tmp_path / "request_1.json").exists(), "残留的无正文响应不许变成一次起草"
+    assert state["no_jd_reentries"] == {"reentered": 1, "recovered": 0, "still_no_jd": 1}
+
+    fresh = {"code": 0, "zpData": {"jobInfo": {"postDescription": "JD 全文：重进之后新到的那份响应正文"}}}
+    page2 = _ReentryPage(_SCENE_LIST_URL, new_response=_OkResp(f"https://www.zhipin.com{_DETAIL_FRAG}", fresh))
+    results2, _calls2, state2 = _run_reentry_job(tmp_path, monkeypatch, page2)
+    assert [r["status"] for r in results2] == ["applied"], "新响应才是救回，残留不是"
+    assert state2["no_jd_reentries"] == {"reentered": 1, "recovered": 1, "still_no_jd": 0}
+
+
+def test_no_jd_reentry_goto_and_second_grab_are_wired_to_heartbeat(tmp_path, monkeypatch):
+    """拍板 ③ / #56 A3 契约：判形态、重进导航、第二次抓取**三处**都要接上心跳拍点——楔死时
+    「只剩最后一条 label」要能分别指认停在哪一处。判形态那一步尤其不能漏：`on_job_detail` 在
+    分栏视图下自己就是一次无超时 `page.evaluate`（读右栏标题），不拍点的话落空现场的最后一条
+    只会是首抓的 `jd:dom-probe:post`，「判形态时挂住」会被误读成「停在第二次轮询」。
+    默认零行为变更的 `beat_fn=None` 语义由 A3 那批用例守着，本用例只锁接线。"""
+    monkeypatch.setattr(chat_mod, "time", _ReentryClock(step=1.0))
+    beats = []
+    monkeypatch.setattr(mod, "_heartbeat_beat", lambda label: beats.append(label))
+    page = _ReentryPage(_SCENE_LIST_URL)
+    _results, calls, _state = _run_reentry_job(tmp_path, monkeypatch, page)
+    assert calls["standalone"] == ["e1"], "前置：本用例确实走过了重进"
+    assert beats.count("detail:reenter-goto:pre") == 1 and beats.count("detail:reenter-goto:post") == 1
+    pre, post = beats.index("detail:reenter-goto:pre"), beats.index("detail:reenter-goto:post")
+    assert pre < post, "导航前后各一拍，pre 不落单"
+    assert any(lbl.startswith("jd:dom-poll:") for lbl in beats[post:]), "第二次抓取的轮询拍点落在导航之后"
+    title_pre = beats.count("detail:panel-title:pre")
+    title_post = beats.count("detail:panel-title:post")
+    assert title_pre == 1 and title_post == 1, "判形态这一步也拍了点（它自己是无超时 evaluate）"
+    assert beats.index("detail:panel-title:pre") < beats.index("detail:panel-title:post") < pre, (
+        "顺序：先判形态，判出「不在本岗详情」才导航"
+    )
+
+
+def test_no_jd_reentry_stats_keys_always_present_in_report():
+    """#67 验收 4：聚合键在**零重进**的场次也要打出 0——「重进 0 次」与「没有这条读数」是两回事，
+    否则下一轮还是只能肉眼比对条数（口径同 #62 `no_send_reasons`、#65 `recommend_*`）。
+    未接线的桩 state 给零形态而不是缺键（同 `_greeting_ledger_stats`）。"""
+    zero = {"reentered": 0, "recovered": 0, "still_no_jd": 0}
+    assert (
+        mod.build_report(["q"], {"applied": 0, "direct_fallback": 0, "keyword_skips": []}, [])["no_jd_reentries"]
+        == zero
+    )
+    assert mod._no_jd_reentry_stats({}) == zero
+    assert mod._no_jd_reentry_stats({"no_jd_reentries": "不是字典"}) == zero
+    got = mod._no_jd_reentry_stats({"no_jd_reentries": {"reentered": 3, "recovered": 2, "still_no_jd": 1}})
+    assert got == {"reentered": 3, "recovered": 2, "still_no_jd": 1}, "取数只从 state 搬，不在读数层重算"

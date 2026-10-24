@@ -132,12 +132,18 @@ def files_to_scan(staged: bool) -> list[str]:
     return found
 
 
-def load_denylist(root: Path) -> list[str]:
-    """已知个人标识清单：默认读本地 private/，可用 PII_DENYLIST 指向别处（都不入库）。"""
-    import os
+def denylist_source(root: Path) -> tuple[Path, str]:
+    """清单来源的唯一算法：显式 `PII_DENYLIST` 优先，否则回退本地 private/（都不入库）。
 
+    返回 `(路径, 来源)`，来源参与「为什么盲」的措辞——设了却指错与压根没设，补救动作不一样。
+    """
     env = os.environ.get("PII_DENYLIST", "").strip()
-    path = Path(env) if env else root / "private/pii_denylist.txt"
+    return (Path(env), "env") if env else (root / "private/pii_denylist.txt", "fallback")
+
+
+def load_denylist(root: Path) -> list[str]:
+    """已知个人标识清单：一行一个已知个人标识，短于 3 字与注释行不计。"""
+    path, _ = denylist_source(root)
     if not path.is_file():
         return []
     terms = []
@@ -235,9 +241,30 @@ def main() -> int:
     findings: list[str] = []
     check_paths(files, findings)
     check_symlinks(tracked_symlinks(args.staged), findings)
-    check_content(files, load_denylist(root), findings)
+    denylist = load_denylist(root)
+    check_content(files, denylist, findings)
 
     scope = "staged" if args.staged else "tracked"
+
+    if not denylist:
+        # 缺失不拦（公开仓 CI 整树扫描天然没有 denylist，缺失即拦会把 CI 打成必红），
+        # 但失明必须显式可见，且在「拦下」与「放行」两种结局里都要说得出——只放在 clean 分支，
+        # BLOCKED 那份读数就分不清是带清单拦的还是盲拦。打 stderr，钩子与闸门日志都留这行。
+        path, kind = denylist_source(root)
+        if path.is_file():
+            why = f"清单 `{path}` 在，但没有可用词条（每行需 ≥3 字且非注释）"
+        elif kind == "env":
+            why = f"`PII_DENYLIST` 指向的 `{path}` 不存在"
+        else:
+            why = f"未设 `PII_DENYLIST`，回退路径 `{path}` 也不存在"
+        print(
+            f"[boundary] WARN 仅形态扫描：denylist 未加载（{why}），"
+            "姓名/公司名这一层是失明的——形态规则抓不到真实姓名。"
+            "补救：给运行本脚本的进程设 `PII_DENYLIST=<清单文件>`，"
+            "或在本仓根放 `private/pii_denylist.txt`。",
+            file=sys.stderr,
+        )
+
     if findings:
         print(f"[boundary] BLOCKED：{len(findings)} 处个人数据命中（范围={scope}）")
         for line in findings[:60]:
@@ -247,10 +274,12 @@ def main() -> int:
         print("\n处理方式：删除该内容或改用占位符；确认为合成夹具的行在该行加 `pii-ok`。")
         return 1
 
+    # 「denylist 已加载」与「仅形态扫描」是跨文件契约：promote_public.hook_boundary_reading
+    # 按这两个子串判读钩子那一侧的姓名/公司名层在不在跑，改文案要连着改那一处。
     print(
         f"[boundary] clean（{len(files)} 个 {scope} 文件；denylist 已加载）"
-        if load_denylist(root)
-        else f"[boundary] clean（{len(files)} 个 {scope} 文件；未找到 private/pii_denylist.txt，仅形态扫描）"
+        if denylist
+        else f"[boundary] clean（{len(files)} 个 {scope} 文件；仅形态扫描）"
     )
     return 0
 

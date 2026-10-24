@@ -37,7 +37,9 @@ from platforms.chat_first import (  # noqa: E402  #判据与中文标签都在 �
     read_state,
 )
 import _logging  # noqa: E402  #38 机读日志旁路（双轨制：print 人读层与测试契约不动）
+import _followup_shape as fshape  # noqa: E402  #63 切片 B：残缺判据与 live_apply 同一份出处（本脚本是第二个 writer）
 import _inbound_watermark as wm  # noqa: E402  #75 水位线判据在单一真源里，本脚本只读、只报、不推进
+from _atomic_io import write_json_atomic  # noqa: E402  #63：本脚本写的这份报告是残缺判据的基准输入
 from _profile_paths import (  # noqa: E402  #28：私有路径唯一出口
     browser_profile_dir,
     private_path,
@@ -163,6 +165,54 @@ def upsert_annotations(path, annotations, now=None):
     return data
 
 
+def _load_prev_report(path):
+    """上一份报告的内容（不存在 / 坏 JSON / 顶层非对象 ⇒ `None`＝没有可比基准，本次照常落盘）。
+    **其余异常（权限等）向上抛**：判不出基准时不许把「读不到」当成「没有基准」放行覆盖
+    ——口径与 `live_apply._prev_followup_report` 一致（那条链路有既有用例守着同一件事），
+    `_shape_guard` 把抛上来的形态接成「不覆盖 + warn」，与 live_apply 的外层 try 同一处置方向。"""
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _shape_guard(out_path, report):
+    """#63 切片 B 的残缺判据（本脚本这条独立链路此前**完全没有**判据，#64 的教训就是第二个
+    writer 同病却被漏掉）：否决与否、怎么措辞全在 `_followup_shape.decide` / `phrase`，与
+    `live_apply._collect_fresh_followup` 调的是同一份，判据不各写一份。
+    返回 `(veto, 签名读数)`；`veto` 为真时调用方**不覆盖**上一份报告（那一场落盘的是旧内容，
+    盖章过的这份 report 对象不入盘——本脚本没有会话 report.json 可放，数字由 warn 行当面念出来；
+    `live_apply` 侧无论否决与否都进它的 `report.json`）。读数供收尾打印。
+    签名读数一律先盖进 `report["followupLedger"]`（读不出基准那一支也盖，各格是 `None`）——
+    这份报告是全量覆盖写的，不落就没法回答「上一份的分母是多少」，趋势侧的 `denominator`
+    也从这一个键取值。
+    这段排在 `wm.attach_readings` **之前**是刻意的：水位线那两个恒在键属于「真正落盘的那份报告」，
+    先落键再否决等于把读数写进一份被丢弃的报告（live_apply 侧同序，注释同源）。"""
+    report["followupLedger"] = fshape.build_ledger()
+    try:
+        prev = _load_prev_report(out_path)
+    except (OSError, UnicodeDecodeError) as e:
+        print(f"[warn] 上一份报告读不出（{str(e)[:80]}）——判不出基准时不覆盖 {out_path}，请先人工排查")
+        return True, {}
+    veto, reading = fshape.decide(prev, report)
+    report["followupLedger"] = fshape.build_ledger(reading, report.get("followupCollection"))
+    if veto:
+        print(f"[warn] 采集判为残缺——{fshape.phrase(reading)}——沿用上次报告不覆盖 {out_path}")
+        # 机读旁路留一份（#48 的口径：这类事件必须落盘才谈得上事后复盘）。本脚本否决时**不写**
+        # followup_report.json，所以那三个数字否则只活在终端一行里——独立跑本脚本的场次事后
+        # 无处可查（live_apply 侧不用补：它的 ledger 进会话 report.json，本来就落盘）。
+        # level 用 error 而非 warning：默认落盘阈值是 ERROR，warning 级会被静默吞掉（#48 的病）。
+        _logging.log_event(
+            "followup_incomplete",
+            level="error",
+            **{k: reading.get(k) for k in fshape.READING_KEYS},
+            out_path=str(out_path),
+        )
+        return True, reading
+    return False, reading
+
+
 def run():
     name, prefix = resolve_active_profile()
     print(profile_line(name, prefix))
@@ -198,6 +248,12 @@ def run():
         print(f"[warn] 采集到 0 条对话（疑似登录态过期/掉线）——沿用上次报告，不覆盖 {out_path}")
         return
 
+    # 残缺判据（#63 切片 B）：0 条那条老防线之外，这条独立链路此前没有任何判据。
+    # 判据本体在 `_followup_shape.decide`，与 live_apply 同一份出处；veto 时不覆盖。
+    veto, shape_reading = _shape_guard(out_path, report)
+    if veto:
+        return
+
     # 水位线读数（#75）：拿本场只读快照与上次基准比，两个恒在键就地落进 report。
     # 判据、形态、措辞与「怎么落键」都在 `_inbound_watermark.attach_readings`（条目 B：三个消费者
     # 共用一个函数，免得各自接一遍接漏），这里只接线 + 打印。无基准时 N 是 None（**不是**全部条数）。
@@ -208,8 +264,16 @@ def run():
     # 入站且在等回话：末条是对方发言、又归不到我们的投递记录（对方主动来撩的那批）
     unlinked_replied = inbound_waiting(report["conversations"])
 
-    with open(out_path, "w", encoding="utf-8") as f:
-        json.dump(report, f, ensure_ascii=False, indent=2)
+    # 原子写（#63，理由与 live_apply 侧 #59 二轮那条同源）：这份报告现在是
+    # `_followup_shape.decide` 的基准输入，半写一次就自造一次「上一份读不出＝没有基准」，
+    # 等于把否决腿自己拆掉。
+    write_json_atomic(out_path, report)
+
+    # 签名不静默（票面验收 4）：unknown（上一份没有可比条目）与散落形态都要当场念出来，
+    # stable 不打扰。措辞调 `_followup_shape.phrase`——与 live_apply 的收尾行同一份句子，
+    # 不在两个 writer 各拼一遍（#64/#75 的老事故）。
+    if fshape.should_announce(shape_reading):
+        print(f"[清单签名] {fshape.phrase(shape_reading)}")
 
     print(
         f"[统计] 对话 {report['totalConversations']} | HR已回复 {report['hrReplied']} | "
@@ -317,7 +381,8 @@ def annotate(annotations_path, out_path=None, history_path=None, store_path=None
         merge_annotations(json.loads(Path(out_path).read_text(encoding="utf-8")), data["annotations"]),
         json.loads(Path(history_path).read_text(encoding="utf-8")).get("applied", []),
     )
-    Path(out_path).write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    # 同一个文件的第二个写手（标注回填）：半写同样毒化 #63 的基准输入，故与 run() 同一条原子写
+    write_json_atomic(out_path, report)
     print(f"[done] 标注 {len(data['annotations'])} 条 → {store_path}，已回填 {out_path}")
 
 

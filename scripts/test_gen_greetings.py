@@ -14,6 +14,8 @@ assert _spec is not None and _spec.loader is not None, "importlib spec 加载失
 mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(mod)
 
+import _followup_shape as fshape  # noqa: E402  #63 切片 B：签名读数与台账由生产函数造，夹具不手搓键名
+
 
 # --- 批量只到草稿：promote 只收 approved ---
 
@@ -1092,14 +1094,14 @@ def test_pending_prune_expires_after_30d():
 
 def test_persist_eval_output_writes_trend_and_queue(tmp_path):
     """eval 产物持久化组合：报告写盘 + 趋势快照追加 + 有候选入队。
-    返回 (待审数, 快照, 趋势写入状态)（#59：追加结果要能传给终端措辞；R4-5：状态是咽喉的
-    返回值本身，调用方不再自己重读 trend 判第二遍）。"""
+    返回 (待审数, 快照, 趋势写入状态, append 前历史)（#59：追加结果要能传给终端措辞；R4-5：状态是
+    咽喉的返回值本身，调用方不再自己重读 trend 判第二遍；#82：第 4 项是渲染方要的 append 前历史）。"""
     convs, grs = _bulk_fixture(30, "公司003")
     out = mod.eval_greetings(convs, grs, [], now="2026-09-09T20:00:00")
     eval_path = tmp_path / "greeting_evaluation.json"
     trend_path = tmp_path / "eval_trend.jsonl"
     pending_path = tmp_path / "pending_promotions.json"
-    n, snap, trend_status = mod.persist_eval_output(
+    n, snap, trend_status, _history = mod.persist_eval_output(
         out,
         evaluation_path=eval_path,
         trend_path=trend_path,
@@ -1122,7 +1124,7 @@ def test_persist_eval_output_no_candidates_touches_no_queue(tmp_path):
     out = mod.eval_greetings(_eval_report(), _eval_greetings(), [], now="2026-09-09T20:00:00")
     trend_path = tmp_path / "eval_trend.jsonl"
     pending_path = tmp_path / "pending_promotions.json"
-    n, snap, trend_status = mod.persist_eval_output(
+    n, snap, trend_status, _history = mod.persist_eval_output(
         out,
         evaluation_path=tmp_path / "e.json",
         trend_path=trend_path,
@@ -1144,7 +1146,7 @@ def test_persist_eval_output_false_zero_blocked_at_chokepoint(tmp_path):
     trend_path = tmp_path / "eval_trend.jsonl"
     _seed_trend(trend_path, 59)
     before = trend_path.read_text(encoding="utf-8")
-    _, snap, trend_status = mod.persist_eval_output(
+    _, snap, trend_status, _history = mod.persist_eval_output(
         out,
         evaluation_path=tmp_path / "e.json",
         trend_path=trend_path,
@@ -1166,7 +1168,7 @@ def test_persist_eval_output_reports_duplicate_not_false_zero(tmp_path):
     trend_path = tmp_path / "eval_trend.jsonl"
     _seed_trend(trend_path, 59)
     before = trend_path.read_text(encoding="utf-8")
-    _, _, first = mod.persist_eval_output(
+    _, _, first, _history = mod.persist_eval_output(
         out,
         evaluation_path=tmp_path / "e.json",
         trend_path=trend_path,
@@ -1178,7 +1180,7 @@ def test_persist_eval_output_reports_duplicate_not_false_zero(tmp_path):
     # 咽喉拒写 ⇒ 历史没动；把最新一条换成同一份 0 样本快照，于是「内容相同」与「假零」同时成立
     zero = mod.trend_snapshot(out, profile="p", now="2026-09-30T00:14:12")
     trend_path.write_text(before + json.dumps({k: v for k, v in zero.items() if k != "ts"}) + "\n", encoding="utf-8")
-    _, _, second = mod.persist_eval_output(
+    _, _, second, _history = mod.persist_eval_output(
         out,
         evaluation_path=tmp_path / "e.json",
         trend_path=trend_path,
@@ -1444,7 +1446,10 @@ def test_record_session_snapshot_refusal_branches_match_the_normal_shape(tmp_pat
     `review_due` + `density_due` 两键恒在。旧版假零分支只回 reason + snapshot，注释却声称
     「density_due 吃 eval 输出、不受本防线影响」，而那个返回体里键根本不存在：
     `live_apply.edd_wrapup` 对两键只做 `.get(...) or {}`，缺键时整块提示判定在消费侧消失，
-    消费方分辨不了「没有键」与「判定为否」（该形态下 due 大概率为 False，但那是另一件事）。"""
+    消费方分辨不了「没有键」与「判定为否」（该形态下 due 大概率为 False，但那是另一件事）。
+    #63 切片 B 给两个后-eval 出口都加了 `trend_status`（`is_appended` 的唯一取数处，
+    样本下降那一格靠它念出来）——本条钉的不变量没变：**拒写分支形状 = 正常分支形状 + reason**，
+    下面 `shape()` 用的就是 `set(normal) | {"reason"}`，所以加键不用改那条断言。"""
     normal_paths = _session_paths(tmp_path / "normal")
     (tmp_path / "normal").mkdir()
     normal_paths["followup"].write_text(json.dumps(_eval_report()), encoding="utf-8")
@@ -1452,7 +1457,16 @@ def test_record_session_snapshot_refusal_branches_match_the_normal_shape(tmp_pat
     normal_paths["annotations"].write_text("{}", encoding="utf-8")
     normal = mod.record_session_snapshot(normal_paths, profile="p", now="2026-09-17T10:00:00")
     assert normal["trend_appended"] is True
-    assert set(normal) == {"trend_appended", "snapshot", "review_due", "density_due"}, normal
+    # 两个出口的键集合对称性本身（#82 起带 `trend_history`：append 前的历史，渲染方一次性输入；
+    # #63 起带 `trend_status`：「写没写盘」的唯一问法）。注册新键不改变这条要守的东西。
+    assert set(normal) == {
+        "trend_appended",
+        "trend_status",
+        "snapshot",
+        "review_due",
+        "density_due",
+        "trend_history",
+    }, normal
 
     def shape(result):
         assert result["trend_appended"] is False, "夹具须真的走到拒写分支"
@@ -1471,6 +1485,26 @@ def test_record_session_snapshot_refusal_branches_match_the_normal_shape(tmp_pat
     dup = mod.record_session_snapshot(normal_paths, profile="p", now="2026-09-17T10:00:00")
     assert "幂等" in dup["reason"], dup
     shape(dup)
+
+
+def test_record_session_snapshot_hands_out_the_pre_append_history(tmp_path):
+    """#82 会话侧契约：`trend_history` 是**追加之前**读到的历史，不含本场快照自己——渲染方
+    （`live_apply.edd_wrapup`）靠它出「vs 上次」；写后读的话 `trend[-1]` 就是本场，增量恒 +0。
+    拒写分支也带这一键（形状对称），内容同样是 append 前那份（咽喉没写，历史本就未变）。"""
+    paths = _session_paths(tmp_path)
+    paths["followup"].write_text(json.dumps(_eval_report()), encoding="utf-8")
+    paths["greetings"].write_text(json.dumps(_eval_greetings()), encoding="utf-8")
+    paths["annotations"].write_text("{}", encoding="utf-8")
+    _seed_trend(paths["trend"], 50, ts="2026-10-20T21:25:13")
+    result = mod.record_session_snapshot(paths, profile="p", now="2026-10-22T05:38:11")
+    assert result["trend_appended"] is True
+    assert [h["ts"] for h in result["trend_history"]] == ["2026-10-20T21:25:13"], result["trend_history"]
+    assert result["snapshot"]["ts"] not in [h["ts"] for h in result["trend_history"]]
+    assert len(paths["trend"].read_text(encoding="utf-8").splitlines()) == 2, "本场快照没入账"
+
+    refused = mod.record_session_snapshot(paths, profile="p", now="2026-10-22T06:00:00")
+    assert refused["trend_appended"] is False and "幂等" in refused["reason"], refused
+    assert [h["sampleSize"] for h in refused["trend_history"]] == [50, 2], "拒写分支的历史不是 append 前那份"
 
 
 def test_record_session_snapshot_refusal_reason_comes_from_the_chokepoint_status(tmp_path):
@@ -1510,6 +1544,42 @@ def test_record_session_snapshot_appends_growth_after_nonzero_history(tmp_path):
     assert result["snapshot"]["sampleSize"] == 51
     assert result["trend_appended"] is True
     assert len(paths["trend"].read_text(encoding="utf-8").splitlines()) == 2
+
+
+_SAMPLE_JUMP_REASON = "样本较上次记录新增 10 条（≥10）"
+
+
+def test_record_session_snapshot_append_branch_reviews_against_pre_append_history(tmp_path):
+    """#82 同族缺陷（追加成功分支）：`review_due` 必须吃 append **之前**的历史。
+    旧写法写完才 `load_trend` ⇒ `trend[-1]` 是本场快照自己 ⇒ `step` 恒 0，
+    批次级审阅提示（#37 拍板 Q1 的决策级机制）在正常收尾路径上永不触发。
+    历史 40、本场 50 ⇒ step=10 须给出「样本较上次记录新增 10 条」这条理由。"""
+    paths = _session_paths(tmp_path)
+    report, greets = _n_pair_fixtures(50)
+    paths["followup"].write_text(json.dumps(report), encoding="utf-8")
+    paths["greetings"].write_text(json.dumps(greets), encoding="utf-8")
+    paths["annotations"].write_text("{}", encoding="utf-8")
+    _seed_trend(paths["trend"], 40)
+    result = mod.record_session_snapshot(paths, profile="p", now="2026-09-30T00:10:19")
+    assert result["trend_appended"] is True, result
+    assert result["snapshot"]["sampleSize"] == 50
+    assert _SAMPLE_JUMP_REASON in result["review_due"]["reasons"], result["review_due"]
+    assert result["review_due"]["due"] is True, result["review_due"]
+
+
+def test_record_session_snapshot_append_branch_stays_quiet_below_the_step(tmp_path):
+    """反向钉住阈值（防把判定写宽）：历史 47、本场 50 ⇒ step=3 < 10，
+    不出现样本跃迁理由（另一条「超 3 天且有新回复」由夹具的 ts 差 0 天排除）。"""
+    paths = _session_paths(tmp_path)
+    report, greets = _n_pair_fixtures(50)
+    paths["followup"].write_text(json.dumps(report), encoding="utf-8")
+    paths["greetings"].write_text(json.dumps(greets), encoding="utf-8")
+    paths["annotations"].write_text("{}", encoding="utf-8")
+    _seed_trend(paths["trend"], 47)
+    result = mod.record_session_snapshot(paths, profile="p", now="2026-09-30T00:10:19")
+    assert result["trend_appended"] is True, result
+    assert not any("样本较上次记录新增" in r for r in result["review_due"]["reasons"]), result["review_due"]
+    assert result["review_due"]["due"] is False, result["review_due"]
 
 
 def test_annotation_for_conv_prefers_encrypt_job_id():
@@ -1646,3 +1716,245 @@ def test_cmd_eval_silent_without_legacy(tmp_path, capsys, monkeypatch):
     monkeypatch.setattr(mod, "notify", lambda t, m: None)
     mod._cmd_eval(argparse.Namespace(trend=False), paths)
     assert "历史遗留" not in capsys.readouterr().out
+
+
+# --- #63 切片 B：趋势分母接上两个写趋势入口 + decline 状态不静默 ---
+
+
+def _ledger_report(convs, shape, prev_n):
+    """一份「writer 已把签名落进去」的 followup 报告形状。
+    `followupLedger` 由生产函数（`compare` + `build_ledger`）造，夹具不手搓键名——
+    键集合改了这边会跟着红，而不是静默空过。`shape` 覆盖成用例要点名那一格。"""
+    prev = {"conversations": [{"encryptJobId": f"p{i}"} for i in range(prev_n)]}
+    reading = {**fshape.compare(fshape.report_conversations(prev), convs), "shape": shape}
+    return {"conversations": convs, "followupLedger": fshape.build_ledger(reading)}
+
+
+def test_record_session_snapshot_carries_denominator_into_trend(tmp_path):
+    """会话侧（投递收尾真读的那条路）：快照里 `denominator` 恒在，分母取自刚 eval 的那份报告——
+    报告带着 writer 落的 `followupLedger` 时签名一起进去（#75 review 条目 B 同病：只接一个入口，
+    恒在键恰在用户真读的那条路上破）。"""
+    paths = _session_paths(tmp_path)
+    convs = _eval_report()["conversations"]
+    paths["followup"].write_text(json.dumps(_ledger_report(convs, "scattered_lost", prev_n=9)), encoding="utf-8")
+    paths["greetings"].write_text(json.dumps(_eval_greetings()), encoding="utf-8")
+    paths["annotations"].write_text("{}", encoding="utf-8")
+    result = mod.record_session_snapshot(paths, profile="p", now="2026-10-09 12:00:00")
+    expected = {"conversations": len(convs), "shape": "scattered_lost"}
+    assert result["snapshot"]["denominator"] == expected, result
+    trend = json.loads(paths["trend"].read_text(encoding="utf-8").splitlines()[-1])
+    assert trend["denominator"] == expected, trend
+
+
+def test_record_session_snapshot_denominator_is_none_without_evidence(tmp_path):
+    """旧报告（没有 `followupLedger` 那一格）：条数读得到 ⇒ 分母在、签名是 None；
+    两个都读不到 ⇒ 整个 `denominator` 是 None，**不补 0**。"""
+    paths = _session_paths(tmp_path)
+    paths["followup"].write_text(json.dumps(_eval_report()), encoding="utf-8")
+    paths["greetings"].write_text(json.dumps(_eval_greetings()), encoding="utf-8")
+    paths["annotations"].write_text("{}", encoding="utf-8")
+    result = mod.record_session_snapshot(paths, profile="p", now="2026-10-09 12:00:00")
+    assert result["snapshot"]["denominator"] == {"conversations": 2, "shape": None}, result
+
+
+def test_record_session_snapshot_reports_decline_as_written(tmp_path):
+    """#63 验收 4 的会话侧：样本比趋势最新一条少 ⇒ `trend_appended` 仍是 True（已落盘），
+    额外的状态走 `trend_status`（「写没写盘」由 `_edd.is_appended` 一处问，判序不在这里复制）。"""
+    paths = _session_paths(tmp_path)
+    paths["followup"].write_text(json.dumps(_eval_report()), encoding="utf-8")
+    paths["greetings"].write_text(json.dumps(_eval_greetings()), encoding="utf-8")
+    paths["annotations"].write_text("{}", encoding="utf-8")
+    _seed_trend(paths["trend"], 50)
+    result = mod.record_session_snapshot(paths, profile="p", now="2026-10-09 12:00:00")
+    assert result["trend_appended"] is True and result["trend_status"] == mod.TREND_APPENDED_DECLINE, result
+    assert len(paths["trend"].read_text(encoding="utf-8").splitlines()) == 2, "decline 被当成拒写，样本消失了一场"
+    assert result["snapshot"]["sampleSize"] == 2
+    # 拒写分支的形状不变量仍在：`trend_status` 同样带上，只是 `trend_appended` 为 False
+    _seed_trend(paths["trend"], 50)
+    paths["followup"].write_text(json.dumps(_unpaired_report()), encoding="utf-8")
+    refused = mod.record_session_snapshot(paths, profile="p", now="2026-10-09 13:00:00")
+    assert refused["trend_appended"] is False and refused["trend_status"] == mod.TREND_FALSE_ZERO, refused
+
+
+def test_persist_eval_output_passes_denominator_through(tmp_path):
+    """eval 侧入口：调用方给得出分母就必须落进快照与磁盘那一行；给不出（默认 None）时键恒在、值 None。"""
+    out = mod.eval_greetings(_eval_report(), _eval_greetings(), [], now="2026-10-09T12:00:00")
+    trend_path = tmp_path / "eval_trend.jsonl"
+    given = {"conversations": 76, "shape": "scattered_lost"}
+    _, snap, status, _hist = mod.persist_eval_output(
+        out,
+        evaluation_path=tmp_path / "e.json",
+        trend_path=trend_path,
+        pending_path=tmp_path / "p.json",
+        profile="p",
+        now="2026-10-09T12:00:00",
+        denominator=given,
+    )
+    assert status == mod.TREND_APPENDED and snap["denominator"] == given
+    assert json.loads(trend_path.read_text(encoding="utf-8").splitlines()[-1])["denominator"] == given
+    _, bare, _st, _h2 = mod.persist_eval_output(
+        out,
+        evaluation_path=tmp_path / "e2.json",
+        trend_path=tmp_path / "t2.jsonl",
+        pending_path=tmp_path / "p2.json",
+        profile="p",
+        now="2026-10-09T12:00:00",
+    )
+    assert bare["denominator"] is None, "缺省不落 0"
+
+
+def test_cmd_eval_lands_denominator_from_the_report_it_evaluated(tmp_path, monkeypatch, capsys):
+    """接线证明（#33 那类「函数没问题但调用点没接」的教训）：`eval` 命令把**它自己刚读的那份报告**
+    的分母传给 `persist_eval_output`，不是事后反推。"""
+    seen = {}
+    real = mod.persist_eval_output
+
+    def spy(out, **kw):
+        seen["denominator"] = kw.get("denominator")
+        return real(out, **kw)
+
+    monkeypatch.setattr(mod, "persist_eval_output", spy)
+    report = _ledger_report(_eval_report()["conversations"], "tail_truncated", prev_n=9)
+    paths = _eval_cmd_paths(tmp_path, report, _eval_greetings())
+    monkeypatch.setattr(mod, "notify", lambda t, m: None)
+    mod._cmd_eval(argparse.Namespace(trend=False), paths)
+    assert seen["denominator"] == {"conversations": 2, "shape": "tail_truncated"}, seen
+    assert "趋势快照已追加" in capsys.readouterr().out
+
+
+def test_cmd_eval_decline_wording_names_the_drop(tmp_path, monkeypatch, capsys):
+    """`eval --trend` 侧的措辞：decline 那一格的动词仍是「已追加」（说了谎的「未追加」更糟），
+    括注必须点名「样本数低于最新一条」（票面验收 4：不静默追加）。"""
+    paths = _eval_cmd_paths(
+        tmp_path, _ledger_report(_eval_report()["conversations"], "stable", prev_n=2), _eval_greetings()
+    )
+    _seed_trend(paths["trend"], 50)
+    monkeypatch.setattr(mod, "notify", lambda t, m: None)
+    mod._cmd_eval(argparse.Namespace(trend=False), paths)
+    out = capsys.readouterr().out
+    assert "趋势快照已追加" in out and "样本数低于最新一条" in out, out
+
+
+def _seed_trend_history(path, points):
+    """预置多条趋势历史（真实 eval_trend.jsonl 形状，#82 用）。"""
+    path.write_text(
+        "".join(json.dumps(item, ensure_ascii=False) + "\n" for item in points),
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_cmd_eval_trend_table_compares_the_pre_append_history(tmp_path, capsys, monkeypatch):
+    """#82 的 `eval --trend` 侧：对比表的 previous 列与 Δprev 必须是**上一条**，不是本场自己。
+    旧写法在 `persist_eval_output` 追加之后才 `load_trend` ⇒ `trend[-1] == current`，previous 列
+    与 current 列同值、Δprev 恒 +0。历史 40/1 + 47/2 → 本场 50/4 ⇒ Δprev 样本 +3 / 回复 +2。"""
+    report, greetings = _dense_eval_fixtures(4, 50)
+    paths = _eval_cmd_paths(tmp_path, report, greetings)
+    _seed_trend_history(
+        paths["trend"],
+        [
+            {
+                "ts": "2026-10-18T08:00:00",
+                "profile": "p",
+                "sampleSize": 40,
+                "repliedCount": 1,
+                "overallRate": 0.025,
+                "minTotal": 30,
+            },
+            {
+                "ts": "2026-10-20T21:25:13",
+                "profile": "p",
+                "sampleSize": 47,
+                "repliedCount": 2,
+                "overallRate": 2 / 47,
+                "minTotal": 30,
+            },
+        ],
+    )
+    monkeypatch.setattr(mod, "notify", lambda t, m: None)
+    mod._cmd_eval(argparse.Namespace(trend=True), paths)
+    out = capsys.readouterr().out
+    assert "== EDD 趋势对比 ==" in out, out
+    table = out.split("== EDD 趋势对比 ==")[1]
+    row = next(line for line in table.splitlines() if line.strip().startswith("样本"))
+    assert "previous(2026-10-20)" in table, f"previous 列不是上一条：{table}"
+    assert "+3" in row and "47" in row, f"Δprev 不是相对上一条的差值：{row}"
+    replied_row = next(line for line in table.splitlines() if line.strip().startswith("回复"))
+    assert "+2" in replied_row, f"回复 Δprev 须 +2：{replied_row}"
+
+
+def _trend_table_row(text, label):
+    """从 `eval --trend` 的终端输出里按行首标签切出对比表的一行单元格（列值与 Δ 值都不含空格）。"""
+    table = text.split("== EDD 趋势对比 ==")[1]
+    line = next(ln for ln in table.splitlines() if ln.strip().startswith(label))
+    return line.split()
+
+
+def test_cmd_eval_trend_table_keeps_the_duplicate_snapshot_as_previous(tmp_path, capsys, monkeypatch):
+    """#82 禁法的正例（duplicate 分支）：本场快照入账后紧接着再跑一次同内容的 `eval --trend` ⇒
+    `append_trend` 幂等跳过、趋势文件没长，但 append **前**那份历史里**确实**含着刚入账的这条
+    ⇒ previous 列就是它，Δprev +0 是**合法读数**（同一份数据读两遍，本来就没变），读数不塌冷启动。
+    「末条内容与 current 相同就剔除」的兜底会把 previous 退到更早的一条（Δprev 变成样本 +3 / 回复 +2、
+    回复率 +3.7pp），历史只剩一条时更直接塌成「baseline 记录于本条」——那种兜底一进仓本条就红。
+    末段再钉一种同内容且**同 ts** 的入账形态（同一秒内重跑 `eval` 就是这样）：上面 CLI 那次的 ts 由
+    墙钟决定、与本场是否同秒不可控，按 ts 剔除的兜底只有在同秒时才被前面那几条断言抓到，这里用
+    显式 `now` 把它变成必然。"""
+    report, greetings = _dense_eval_fixtures(4, 50)
+    paths = _eval_cmd_paths(tmp_path, report, greetings)
+    _seed_trend_history(
+        paths["trend"],
+        [
+            {
+                "ts": "2026-10-18T08:00:00",
+                "profile": "p",
+                "sampleSize": 40,
+                "repliedCount": 1,
+                "overallRate": 0.025,
+                "minTotal": 30,
+            },
+            {
+                "ts": "2026-10-20T21:25:13",
+                "profile": "p",
+                "sampleSize": 47,
+                "repliedCount": 2,
+                "overallRate": 2 / 47,
+                "minTotal": 30,
+            },
+        ],
+    )
+    monkeypatch.setattr(mod, "notify", lambda t, m: None)
+    mod._cmd_eval(argparse.Namespace(trend=True), paths)
+    first = capsys.readouterr().out
+    assert "趋势快照已追加" in first, f"夹具没先把本场快照写进趋势：{first}"
+    trend_lines = paths["trend"].read_text(encoding="utf-8").splitlines()
+    assert len(trend_lines) == 3, f"本场快照没入账：{trend_lines}"
+    recorded = json.loads(trend_lines[-1])
+    assert (recorded["sampleSize"], recorded["repliedCount"]) == (50, 4), recorded
+
+    # 同一份数据再跑一次：咽喉幂等跳过（趋势文件不涨），但历史里那条是真的上一条
+    mod._cmd_eval(argparse.Namespace(trend=True), paths)
+    second = capsys.readouterr().out
+    assert "幂等跳过" in second, f"第二次没走到 duplicate 分支：{second}"
+    assert len(paths["trend"].read_text(encoding="utf-8").splitlines()) == 3, "duplicate 那次把趋势写长了"
+    assert _trend_table_row(second, "样本") == ["样本", "40", "50", "50", "+0", "+10"], second
+    assert _trend_table_row(second, "回复") == ["回复", "1", "4", "4", "+0", "+3"], second
+    assert _trend_table_row(second, "回复率") == ["回复率", "2.5%", "8.0%", "8.0%", "+0.0pp", "+5.5pp"], second
+    assert "baseline 记录于本条" not in second, f"读数被剔成冷启动：{second}"
+
+    # 同内容**且同 ts**（显式 `now` 取历史末条那条的 ts）：按 ts 剔除的兜底在这里必然误伤。
+    # 分母那一格必须与上面 CLI 那次写进去的**同一个读数**，否则这条直接调用就不再是「同内容」——
+    # #63 起快照带 `denominator`，而它是调用方从自己刚读的那份报告算出来的（#75 条目 B 同一条纪律）。
+    _, snap3, status3, hist3 = mod.persist_eval_output(
+        mod.eval_greetings(report, greetings, []),
+        evaluation_path=paths["evaluation"],
+        trend_path=paths["trend"],
+        pending_path=paths["pending"],
+        profile="p",
+        now=recorded["ts"],
+        denominator=fshape.denominator(report),
+    )
+    assert status3 == mod.TREND_DUPLICATE, status3
+    assert hist3[-1]["ts"] == snap3["ts"] and hist3[-1]["sampleSize"] == snap3["sampleSize"], hist3
+    table3 = mod.render_trend_table(snap3, hist3)
+    assert _trend_table_row(table3, "样本") == ["样本", "40", "50", "50", "+0", "+10"], table3
+    assert "baseline 记录于本条" not in table3, table3

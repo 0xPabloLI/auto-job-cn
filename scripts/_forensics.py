@@ -334,8 +334,8 @@ def _wedge_dump_enabled():
     heartbeat 一条线索」（本票 5 场楔死的现状），而写错值把取证留着没有任何代价。
     关闭时零 faulthandler 调用（既不武装也不取消），与真实会话一刀切开。
 
-    这张表与仓内另外几张布尔 env 取值表**各不相同**（#56 修复轮 F2 逐字核对过，旧注释
-    「口径照 LIVE_RECORD / LIVE_PREFLIGHT」不成立）；**多张表的逐行对照只有一份真源**，
+    这张表与仓内另外几张布尔 env 取值表**各不相同**（#56 修复轮 F2 逐字核对过，本开关的旧注释
+    自称口径照仓内另两处布尔开关，不成立）；**多张表的逐行对照只有一份真源**，
     在 `_limits.py` 的「布尔 env 开关」小节，这里不再抄一遍。按**行为**钉着这三张表的用例是
     `scripts/test_live_apply.py::test_three_bool_env_switches_have_three_distinct_value_tables`。
     本函数的解析参数逐项就是上面这套口径：strip + lower、关只认 `BOOL_ENV_TWO_OFF`、

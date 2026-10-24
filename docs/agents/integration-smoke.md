@@ -7,18 +7,20 @@
 
 | 模式 | 发送 | 名额消耗 | 可重复 | 证据 |
 | --- | --- | --- | --- | --- |
-| **A dry-run**（本票新增） | 否——发送前 gate 截停 | 零 | 随时 | `report.json`（`dry_run: true`）+ 截图 + 录屏 |
-| **B 真实冒烟** | 是 | 1-2 个 | 不建议频繁 | 台账新增记录 + 退出码 + 录屏 |
+| **A dry-run**（本票新增） | 否——发送前 gate 截停 | 零 | 随时 | `report.json`（`dry_run: true`）+ 截图 |
+| **B 真实冒烟** | 是 | 1-2 个 | 不建议频繁 | 台账新增记录 + 退出码 + 截图 |
 
 ## 前置
 
 - **有头浏览器在本机可跑**（2026-09-21 `1 passed in 136s`；2026-09-22 08:06 推荐流只读探测再验通过）。
-  `live_apply` 用有头浏览器（`headless=False` 硬编码），起不来时按下方**三类形态**逐条核对：前两类
-  **是缺依赖、不是链路缺陷**，三类失败形态各不相同（数秒失败 vs 数分钟超时），看**失败耗时**就能分流：
-  - **Playwright 自带 ffmpeg 在位**（`~/Library/Caches/ms-playwright/ffmpeg-1011/`）：`LIVE_RECORD` 默认 `on`，
-    缺 ffmpeg 会让 driver 进程直接退出，Python 侧只看到 `BrowserType.launch_persistent_context: Connection
-    closed while reading from the driver`（**数秒内失败，不是超时**）。装：`python3 -m playwright install ffmpeg`
-    （约 1 MiB）；或临时 `LIVE_RECORD=off`——dry-run 验收不需要录屏，截图照常产出。
+  `live_apply` 用有头浏览器（`headless=False` 硬编码），起不来时按下方条目逐条核对：第一条是
+  录像链路时代的**史料**（已随 #105 下线，现行链路不会再触发）；现行两类**是缺依赖、不是链路缺陷**，
+  失败形态各不相同（数分钟超时 vs 数秒失败——后者的样本在下面那条史料里），看**失败耗时**就能分流：
+  - **Playwright 自带 ffmpeg 在位**（`~/Library/Caches/ms-playwright/ffmpeg-1011/`）——**环境史料**：该条目的
+    触发面是投递录像链路，已随 #105 于 2026-10-23 整体下线；其他链路（faulthandler 取栈、出网探针）都不经过
+    ffmpeg。保留只为历史排查参考：当年录像链路开着时，缺 ffmpeg 会让 driver 进程直接退出，Python 侧只看到
+    `BrowserType.launch_persistent_context: Connection closed while reading from the driver`
+    （**数秒内失败，不是超时**）。装法（历史）：`python3 -m playwright install ffmpeg`（约 1 MiB）。
   - **首跑辅助资源已下完**（UBO 插件 + GeoLite2 库）：走代理可能极慢，叠加 Playwright 180s 启动超时，表现为
     「终端几分钟没动静，最后 `Timeout 180000ms`」。
   - **⚠️ 2026-09-23 更新：agent 会话内起有头 camoufox，先带上 `MOZ_DISABLE_*` 那组变量**（本文档此前称
@@ -102,7 +104,7 @@
    - `applied == 0`、`greetings.json` 条目数不变——名额与台账零消耗；
    - 不点「立即沟通」：站内不会出现新会话。
 
-4. **留证**：会话目录（`private/data/live_session/<ts>/`，含 `report.json` 与 `shots/`）+ 录屏（`private/data/videos/<ts>/`）。
+4. **留证**：会话目录（`private/data/live_session/<ts>/`，含 `report.json` 与 `shots/`）。
 
 已知的无害副作用：会话收尾会按 #37 追加一条 EDD 趋势快照（`applied=0`，指标数值不变）。
 
@@ -113,7 +115,7 @@
 步骤 = `docs/agents/apply-runbook.md` 的标准投递流程 + 两条限量约束：
 
 - **限量 1-2 岗**：第 1 岗投成（终端出现 `[ok]` 与台账行）后即写会话目录里的 `CLOSE` 文件优雅停止（或 Ctrl+C）。
-- **留证**：`greetings.json` / `apply_log.jsonl` 新增 1-2 条 + 退出码 + 录屏，与模式 A 证据合并归档。
+- **留证**：`greetings.json` / `apply_log.jsonl` 新增 1-2 条 + 退出码 + 会话目录截图，与模式 A 证据合并归档。
 
 ## 边界
 

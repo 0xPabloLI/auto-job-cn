@@ -101,14 +101,10 @@ PACE_PRESETS = {
 # 取值表对照（**刻意不合并成一套**：#56 修复轮 F2 逐字核对后，
 # `test_three_bool_env_switches_have_three_distinct_value_tables` 把这些差异钉成了事实；
 # 想统一就是显式的语义变更，得先改那条用例并另行开票）：
-#   · LIVE_RECORD —— 默认开；**精确串比较**（不 strip 不 lower），关只认字面 "off"（`BOOL_ENV_EXACT_OFF`）
-#                    ⇒ "0" / "OFF" / " off " 都关不掉它；空串按开。
-#                    已走 `env_bool_switch`（调用点 `live_apply._init_live_session`，#57 第二轮后半接线；
-#                    接线时同轮把 `test_three_bool_env_switches_have_three_distinct_value_tables` 的
-#                    钉法从「读源码找那句字面比较」改成「按行为钉方向」——源码断言只能证明那行字还在，
-#                    证明不了方向，改完反而更强，三张表的逐行方向与「三条方向向量互不相同」都在用例里）。
-#   · LIVE_RECOMMEND —— 默认开；与 LIVE_RECORD 同族（精确串、关只认 `BOOL_ENV_EXACT_OFF`）；
-#                    已走 `env_bool_switch`（调用点 `live_apply._apply_collect_cfg`）。
+#   · LIVE_RECOMMEND —— 默认开；**精确串比较**（不 strip 不 lower），关只认字面 "off"
+#                    （`BOOL_ENV_EXACT_OFF`）⇒ "0" / "OFF" / " off " 都关不掉它；空串按开。
+#                    已走 `env_bool_switch`（调用点 `live_apply._apply_collect_cfg`；
+#                    #105 下线录屏开关后，精确串族只剩它一个在用）。
 #   · LIVE_WEDGE_DUMP —— 默认开；strip+lower 后关只认 `BOOL_ENV_TWO_OFF` 两个值，其余（含空串与
 #                    "false"/"no"/"ofs"）一律按开；非法值**不提示**。
 #                    已走 `env_bool_switch`（调用点 `_forensics._wedge_dump_enabled`，#57 第二轮后半接线；
@@ -124,7 +120,7 @@ PACE_PRESETS = {
 #   · LIVE_PREFLIGHT —— 默认开；strip+lower 后关认 `BOOL_ENV_FOUR_OFF` 四个值（比两值族宽在
 #                    "false"/"no"）。接线状态：本轮未接线（不在本票四处之内），列在这儿只为让
 #                    「几张表各长什么样」在一处读全。
-BOOL_ENV_EXACT_OFF = ("off",)  # 精确串族：LIVE_RECORD / LIVE_RECOMMEND
+BOOL_ENV_EXACT_OFF = ("off",)  # 精确串族：LIVE_RECOMMEND（#105 后该族唯一在用开关）
 BOOL_ENV_TWO_OFF = ("0", "off")  # 两值族（strip+lower）：LIVE_WEDGE_DUMP / LIVE_WEDGE_SKIP
 BOOL_ENV_ON_WORDS = ("1", "on", "true", "yes")  # 「可识别的开」词表（仅用于非法值提示，不参与返回值）
 BOOL_ENV_FOUR_OFF = ("off", "0", "false", "no")  # 四值族（strip+lower）：LIVE_PREFLIGHT
@@ -137,8 +133,9 @@ def env_bool_switch(env, name, *, off_values, on_values=(), strip=False, lower=F
       这一条照的是接线前 `_wedge_skip_enabled` 那句 `str(env.get(name) or "")` 的口径（假值先塌成
       空串 ⇒ 不命中 off 表 ⇒ 按默认走，也不提示），所以对抗输入下的返回值与改前逐字一致，
       不是「顺手规范化」。`" "`（纯空白）是**真值**，照常走下面的 strip / lower 与查表。
-      #59 修复轮 R4-4：仓内当时四个开关（LIVE_RECORD / LIVE_RECOMMEND / LIVE_WEDGE_DUMP /
-      LIVE_WEDGE_SKIP）**全部默认开**，「默认关」那个方向零调用方，于是把 `default_on` 形参与它
+      #59 修复轮 R4-4：仓内当时四个开关（LIVE_RECOMMEND / LIVE_WEDGE_DUMP / LIVE_WEDGE_SKIP，
+      外加一个后来随 #105 下线的录屏开关）**全部默认开**，「默认关」那个方向零调用方，于是把
+      `default_on` 形参与它
       带出的三条死分支（未设置的方向、提示文案的方向字/动词/词表）一起删了——要加默认关的开关时
       再按那个调用点的真实语义补，不留没有调用方的分支。
       #56 取证 B 新加的 `LIVE_NET_PROBE` 方向相同（也默认开），所以「默认关」分支**仍然**零调用方。
