@@ -37,6 +37,7 @@ Triage 时定档，复 triage 时可改。
 | `area:pipeline`     | 投递/追踪/知识库链路（live_apply、followup、kb）   |
 | `area:platforms`    | 平台适配层（`scripts/platforms/`）                 |
 | `area:agent-harness`| hooks、`docs/agents/`、session 基础设施            |
+| `area:publish-chain`| 脱敏提升链 `scripts/publish/`、公开侧守卫、公开面文案改写（不是上游 `agent-harness` 那个仓） |
 | `area:webui`        | `webui.py` 管理面板                                |
 | `area:docs`         | 文档与调研材料                                     |
 
