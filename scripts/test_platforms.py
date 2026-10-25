@@ -79,10 +79,10 @@ PLATFORM = platforms.get_platform("chat-first")
 
 # wapi getGeekFriendList.json 条目（真实响应节选，仅裁剪 securityId/avatar 等无关长字段）
 WAPI_MINE_READ = {  # 我方最后发言且对方已读——旧解析把这条误判成 hr_replied（[已读]≠回复）
-    "name": "壬先生",
+    "name": "之先生",
     "brandName": "煦珩人力",
     "title": "猎头顾问",
-    "lastMsg": "壬先生你好，我有7年Solidity智能合约开发经验，深耕DeFi衍生品协议设计。",
+    "lastMsg": "之先生你好，我有7年Solidity智能合约开发经验，深耕DeFi衍生品协议设计。",
     "lastTime": "昨天",
     "lastTS": 1789097252186,
     "lastMessageInfo": {"fromId": 780045835, "toId": 626134785, "status": 2, "msgTime": 1789097252186},
@@ -99,7 +99,7 @@ WAPI_MINE_DELIVERED = {  # 我方最后发言未读（[送达]）
     "encryptJobId": "40cde3336736a7a30nF93Ni1EVBQ",
 }
 WAPI_HR_REPLY = {  # HR 最后发言（真实回复文本）
-    "name": "沐女士",
+    "name": "秉女士",
     "brandName": "煦辰",
     "title": "招聘者",
     "lastMsg": "对你的简历很感兴趣，期待深入交流。",
@@ -112,24 +112,24 @@ WAPI_HR_REPLY = {  # HR 最后发言（真实回复文本）
 # 结构化 DOM 卡片（真实 dump：li[role=listitem] 下的 .time/.name-text/.message-status/.last-msg-text）
 DOM_CHIP = {  # 带状态徽标 = 我方最后发言
     "time": "昨天",
-    "name": "壬先生",
-    "name_box": "壬先生煦珩人力猎头顾问",
+    "name": "之先生",
+    "name_box": "之先生煦珩人力猎头顾问",
     "status": "[已读]",
     "status_read": True,
-    "last_msg": "壬先生你好，我有7年Solidity智能合约开发经验，深耕DeFi衍生品协议设计。",
+    "last_msg": "之先生你好，我有7年Solidity智能合约开发经验，深耕DeFi衍生品协议设计。",
 }
 DOM_NO_CHIP = {  # 无徽标 = HR 最后发言
     "time": "09月09日",
-    "name": "沐女士",
-    "name_box": "沐女士煦辰招聘者",
+    "name": "秉女士",
+    "name_box": "秉女士煦辰招聘者",
     "status": None,
     "status_read": False,
     "last_msg": "对你的简历很感兴趣，期待深入交流。",
 }
 DOM_NO_CHIP_2 = {  # 无徽标，品牌 4 字（match_brand min_len 下限之上，可回填）
     "time": "09月08日",
-    "name": "祐女士",
-    "name_box": "祐女士昀洵网络人事专员",
+    "name": "寒女士",
+    "name_box": "寒女士昀洵网络人事专员",
     "status": None,
     "status_read": False,
     "last_msg": "简历已收到，合适会联系您[抱拳]",
@@ -139,11 +139,11 @@ DOM_NO_CHIP_2 = {  # 无徽标，品牌 4 字（match_brand min_len 下限之上
 def test_parse_friend_entries_field_mapping_and_compat_company():
     out = chat_mod.parse_friend_entries([WAPI_MINE_READ], my_user_id=780045835)
     c = out[0]
-    assert c["name"] == "壬先生", "name 是联系人，不再是时间样式（#30 验收 1）"
-    assert c["company"] == "壬先生煦珩人力猎头顾问", "company 沿用旧粘连语义（reply_annotations 匹配键不变）"
+    assert c["name"] == "之先生", "name 是联系人，不再是时间样式（#30 验收 1）"
+    assert c["company"] == "之先生煦珩人力猎头顾问", "company 沿用旧粘连语义（reply_annotations 匹配键不变）"
     assert c["brandName"] == "煦珩人力"
     assert c["title"] == "猎头顾问"
-    assert c["summary"].startswith("壬先生你好")
+    assert c["summary"].startswith("之先生你好")
     assert c["time"].startswith("2026-09-11"), "time 是真实时间戳，不再是消息正文（#30 验收 2）"
     assert c["lastTime"] == "昨天"
     assert c["encryptJobId"] == "45167fe4a07eec100nF93Ni1EVBQ"
@@ -176,7 +176,7 @@ def test_parse_friend_entries_zero_last_ts_is_passed_through():
 
 
 def test_parse_friend_entries_missing_message_info_has_no_from_id():
-    no_payload = {"name": "己女士", "encryptJobId": "eid1", "lastMsg": None, "lastMessageInfo": None}
+    no_payload = {"name": "五女士", "encryptJobId": "eid1", "lastMsg": None, "lastMessageInfo": None}
     c = chat_mod.parse_friend_entries([no_payload], my_user_id=780045835)[0]
     assert c["lastFromId"] is None, "没有消息体就没有 fromId，不猜成我方"
 
@@ -210,7 +210,7 @@ def test_parse_friend_entries_missing_message_info_is_awaiting():
     """2026-09-24 修复：lastMessageInfo 整体缺失（wapi 未 hydrate，实测 3 条）⇒ 无「对方
     回复」证据，保守归 awaiting——旧逻辑空体默认 False → hr_replied，假阳性污染 replied 统计。"""
     no_payload = {
-        "name": "己女士",
+        "name": "五女士",
         "brandName": "煦昱金创",
         "title": "HRBP",
         "encryptJobId": "eid1",
@@ -234,8 +234,8 @@ def test_parse_dom_cards_semantics():
     out = chat_mod.parse_dom_cards([DOM_CHIP, DOM_NO_CHIP], applied=[])
     mine, hr = out
     assert mine["status"] == "awaiting" and mine["is_read"] is True
-    assert mine["company"] == "壬先生煦珩人力猎头顾问"
-    assert mine["name"] == "壬先生"
+    assert mine["company"] == "之先生煦珩人力猎头顾问"
+    assert mine["name"] == "之先生"
     assert mine["time"] == "昨天", "DOM 路径只有展示串时间"
     assert mine["source"] == "dom"
     assert hr["status"] == "hr_replied" and hr["is_read"] is False
@@ -846,7 +846,7 @@ def test_followup_union_keeps_the_freshest_version_of_a_repeated_conversation(mo
     monkeypatch.setattr(chat_mod.time, "sleep", lambda *_: None)
     old = dict(
         WAPI_MINE_READ,
-        name="辛女士",
+        name="冬女士",
         encryptJobId="eid-fresh-check",
         lastMsg="旧的一条",
         lastTS=1789000000000,

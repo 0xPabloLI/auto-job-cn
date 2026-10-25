@@ -303,8 +303,8 @@ def test_upsert_annotations_keeps_eid_entry_apart_from_same_company(tmp_path):
     mod.upsert_annotations(
         str(store),
         [
-            {"company": "沐女士", "encryptJobId": "eid1", "replyCategory": "interested"},
-            {"company": "沐女士", "replyCategory": "no_reply"},
+            {"company": "秉女士", "encryptJobId": "eid1", "replyCategory": "interested"},
+            {"company": "秉女士", "replyCategory": "no_reply"},
         ],
         now="2026-09-24T10:00:00",
     )
