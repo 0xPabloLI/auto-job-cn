@@ -142,7 +142,7 @@ def test_request_greeting_writes_job_context(tmp_path):
         "brandName": "某Web3公司",
         "salaryDesc": "30-50K",
         "encryptJobId": "abc",
-        "bossName": "澜先生",
+        "bossName": "涓先生",
         "bossTitle": "CTO",
     }
     path = mod.request_greeting(tmp_path, 3, job, "JD 全文：负责合约开发")
@@ -150,7 +150,7 @@ def test_request_greeting_writes_job_context(tmp_path):
     assert path.name == "request_3.json"
     assert data["jobName"] == "智能合约工程师" and data["brandName"] == "某Web3公司"
     assert data["salaryDesc"] == "30-50K" and data["jdText"].startswith("JD 全文")
-    assert data["bossName"] == "澜先生"
+    assert data["bossName"] == "涓先生"
 
 
 def test_wait_reply_picks_up_reply(tmp_path):
@@ -926,9 +926,9 @@ def test_salutation_no_name_uses_ninhao():
 
 
 def test_salutation_honorific_kept_as_is():
-    assert mod.salutation_warnings("涓女士", "HR", "涓女士您好，我有7年经验。") == []
-    warns = mod.salutation_warnings("涓女士", "HR", "您好，我有7年经验。")
-    assert any("涓女士" in w for w in warns), warns
+    assert mod.salutation_warnings("白女士", "HR", "白女士您好，我有7年经验。") == []
+    warns = mod.salutation_warnings("白女士", "HR", "您好，我有7年经验。")
+    assert any("白女士" in w for w in warns), warns
     # 平台装饰前缀：A商务-李经理 → 用「李经理」即算原样保留
     assert mod.salutation_warnings("A商务-李经理", "HR", "李经理您好，我有7年经验。") == []
 
@@ -3811,7 +3811,7 @@ def test_request_greeting_without_recruiter_active_omits_fields(tmp_path):
 
 
 def test_record_greeting_carries_recruiter_active(tmp_path):
-    job = {"encryptJobId": "eid1", "jobName": "岗", "brandName": "司", "bossName": "澜先生", "bossTitle": "CTO"}
+    job = {"encryptJobId": "eid1", "jobName": "岗", "brandName": "司", "bossName": "涓先生", "bossTitle": "CTO"}
     path = tmp_path / "greetings.json"
     assert (
         mod.record_greeting(

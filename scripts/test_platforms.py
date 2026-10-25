@@ -99,7 +99,7 @@ WAPI_MINE_DELIVERED = {  # 我方最后发言未读（[送达]）
     "encryptJobId": "40cde3336736a7a30nF93Ni1EVBQ",
 }
 WAPI_HR_REPLY = {  # HR 最后发言（真实回复文本）
-    "name": "砚女士",
+    "name": "沐女士",
     "brandName": "煦辰",
     "title": "招聘者",
     "lastMsg": "对你的简历很感兴趣，期待深入交流。",
@@ -120,16 +120,16 @@ DOM_CHIP = {  # 带状态徽标 = 我方最后发言
 }
 DOM_NO_CHIP = {  # 无徽标 = HR 最后发言
     "time": "09月09日",
-    "name": "砚女士",
-    "name_box": "砚女士煦辰招聘者",
+    "name": "沐女士",
+    "name_box": "沐女士煦辰招聘者",
     "status": None,
     "status_read": False,
     "last_msg": "对你的简历很感兴趣，期待深入交流。",
 }
 DOM_NO_CHIP_2 = {  # 无徽标，品牌 4 字（match_brand min_len 下限之上，可回填）
     "time": "09月08日",
-    "name": "翠女士",
-    "name_box": "翠女士昀洵网络人事专员",
+    "name": "祐女士",
+    "name_box": "祐女士昀洵网络人事专员",
     "status": None,
     "status_read": False,
     "last_msg": "简历已收到，合适会联系您[抱拳]",
@@ -361,7 +361,7 @@ def test_clean_job_title_strips_only_the_shell():
     不是设想）。只去壳（引号类符号、站名后缀、分隔符后的品牌段），**不动岗位名本身的字**——
     「招聘」是标题的一部分，留着才能拿去搜/比对。"""
     assert (
-        chat_mod.clean_job_title("「区块链-上市公司-六险一金-双休招聘」_四方精创招聘-BOSS直聘")
+        chat_mod.clean_job_title("「区块链-上市公司-六险一金-双休招聘」_覃煦淞厍招聘-BOSS直聘")
         == "区块链-上市公司-六险一金-双休招聘"
     )
     assert (
@@ -398,7 +398,7 @@ def test_classify_job_identity_ok_and_generic_is_not_dead():
     assert chat_mod.classify_job_identity("「综合管理岗招聘」_宓昱闾笪招聘-BOSS直聘")[1] == "ok"
     # 泛化标题**不是失效**——归属守卫只问「这还是不是一个岗位页」，不问「搜不搜得到」
     # （#66 票面那条「泛化标题 45 条深度搜不到」是搜索覆盖问题，与能不能回这条对话无关）
-    assert chat_mod.classify_job_identity("「项目负责人招聘」_知不知咨询有限公司招聘-BOSS直聘")[1] == "ok"
+    assert chat_mod.classify_job_identity("「项目负责人招聘」_曜闾宓旻旻宓闾曜闾招聘-BOSS直聘")[1] == "ok"
     assert chat_mod.classify_job_identity("「爱博家园兼职服务员招聘」_淞邝煦昀昀煦邝淞邝招聘-BOSS直聘")[1] == "ok"
     assert chat_mod.classify_job_identity("")[1] == "unresolved", "title 取不到＝身份未知，不许猜成 ok"
 

@@ -20,7 +20,7 @@ from platforms.chat_first import CHAT_URL, chat_url_for  # noqa: E402
 
 def _conv(
     eid="e1",
-    company="砚女士煦辰招聘者",
+    company="沐女士煦辰招聘者",
     source="wapi",
     status="hr_replied",
     applied=None,
@@ -32,7 +32,7 @@ def _conv(
         "encryptJobId": eid,
         "company": company,
         "brandName": "煦辰",
-        "name": "砚女士",
+        "name": "沐女士",
         "title": "招聘者",
         "source": source,
         "status": status,
@@ -202,9 +202,9 @@ def test_summarize_shape_is_stable():
 def test_request_payload_labels_it_a_reply():
     cand = {
         "encryptJobId": "e1",
-        "company": "砚女士煦辰招聘者",
+        "company": "沐女士煦辰招聘者",
         "brandName": "煦辰",
-        "bossName": "砚女士",
+        "bossName": "沐女士",
         "bossTitle": "招聘者",
         "jobTitle": "区块链工程师招聘",
         "lastMsg": "方便把简历发我看一下吗",
@@ -351,9 +351,9 @@ def _ctx(tmp_path, mode="send", my_user_id=None, snapshot_at="2026-10-20 18:00:0
 
 CAND = {
     "encryptJobId": "e1",
-    "company": "砚女士煦辰招聘者",
+    "company": "沐女士煦辰招聘者",
     "brandName": "煦辰",
-    "bossName": "砚女士",
+    "bossName": "沐女士",
     "bossTitle": "招聘者",
     "jobTitle": "区块链工程师招聘",
     "lastMsg": "方便把简历发我看一下吗",
@@ -504,7 +504,7 @@ def test_reply_one_deeplink_lands_wrong_conversation_is_conv_unreachable(monkeyp
     """深链打开的**不是这条对话**（右侧会话头对不上）⇒ 独立桶 `conv_unreachable` + 存证。
     不许冒充 `conv_not_found`（那是「列表里没有这条」，与「打开时被站点换走了」是两回事），
     更不许往下走：一个字都不打。"""
-    wrong = "六女士江西劲希网络科技HR"
+    wrong = "千女士闾旻昱珀珀昱旻闾HR"
     page = _target_page(header=wrong)
     ctx = _ctx(tmp_path)
     ctx.platform = _FakePlatform(_report())
@@ -547,7 +547,7 @@ def test_reply_one_waits_for_the_panel_header_to_hydrate(monkeypatch, tmp_path):
 
 def test_reply_one_matches_header_across_whitespace(monkeypatch, tmp_path):
     """DOM 的 innerText 带换行，wapi 的 company 是无分隔粘连串——两边都去空白才可比。"""
-    page = _target_page(header="砚女士\n煦辰\n招聘者")
+    page = _target_page(header="沐女士\n煦辰\n招聘者")
     ctx = _ctx(tmp_path)
     ctx.platform = _FakePlatform(_report())
     _patch_runtime(monkeypatch)
@@ -759,7 +759,7 @@ def _snapshot(entries):
 
 
 HR_INBOUND = {
-    "name": "砚女士",
+    "name": "沐女士",
     "brandName": "煦辰",
     "title": "招聘者",
     "lastMsg": "方便把简历发我看一下吗",
@@ -883,7 +883,7 @@ def test_send_refuses_when_only_matches_multiple_conversations(monkeypatch, tmp_
     """同一 `encryptJobId` 对应两条会话（同岗多招聘者）时，`--only` 只给了一个 id 也分不清
     该开哪一位；开哪条都是猜，所以发前就停、两条都落 `conv_ambiguous`，`reply_one` 一次不调。"""
     page = _FakeDeeplinkPage()
-    other = {**HR_INBOUND, "name": "桐先生", "brandName": "别家", "title": "HR", "encryptUid": "enc-uid-2"}
+    other = {**HR_INBOUND, "name": "枫先生", "brandName": "别家", "title": "HR", "encryptUid": "enc-uid-2"}
     tried = []
     monkeypatch.setattr(mod, "startup_jitter", lambda cfg, **k: None)
     monkeypatch.setattr(
@@ -1027,7 +1027,7 @@ def test_report_always_carries_the_watermark_keys(monkeypatch, tmp_path):
     assert report["watermark"]["state"] == "first_run"
 
 
-HR_LATER = {**HR_INBOUND, "encryptJobId": "e2", "name": "桐先生", "brandName": "别家", "lastTS": 1792999999000}
+HR_LATER = {**HR_INBOUND, "encryptJobId": "e2", "name": "枫先生", "brandName": "别家", "lastTS": 1792999999000}
 PREVIOUS_READ = "2026-10-19 09:00:00"  # 「上次读数」的时刻（本场快照固定是 2026-10-20 18:00:00）
 
 
@@ -1081,7 +1081,7 @@ def test_mark_read_echo_separates_read_listed_and_recorded_counts(monkeypatch, t
     **本次读到的整批**（没被列出的那些也算看过——只推列出的那几条会让其余每场重复提醒）。
     三个数各是各的意思，所以这场故意让它们互不相等：读到 3、列出 2、记入 3、线上新 1。"""
     _seed_watermark(tmp_path, [HR_INBOUND])
-    ours = {**HR_INBOUND, "encryptJobId": "e9", "name": "澜先生", "lastMessageInfo": {"fromId": MY_UID, "status": 1}}
+    ours = {**HR_INBOUND, "encryptJobId": "e9", "name": "涓先生", "lastMessageInfo": {"fromId": MY_UID, "status": 1}}
     report, _ = _drive_readonly(monkeypatch, tmp_path, [HR_INBOUND, HR_LATER, ours], mark_read=True)
     out = capsys.readouterr().out
     assert "本次读到 3 条会话、候选清单列出 2 条、记入 3 个会话键（较上次读数新增 1 条）" in out, out
@@ -1105,7 +1105,7 @@ def test_mark_read_never_opens_a_conversation(monkeypatch, tmp_path):
 
 # DOM 降级路径的卡片：两样加密 id 都没有（`parse_friend_entries` 也回填不到 eid，applied 为空）
 KEYLESS_ENTRY = {
-    "name": "砚女士",
+    "name": "沐女士",
     "brandName": "煦辰",
     "title": "招聘者",
     "lastMsg": "方便把简历发我看一下吗",

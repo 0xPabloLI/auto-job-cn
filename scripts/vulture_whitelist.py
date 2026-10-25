@@ -22,3 +22,7 @@ fmt
 # PlatformBase.apply / ChatFirstPlatform.apply（#44 后为 NotImplementedError 空接口）与
 # lagou/liepin stub 的对齐形参——调用方按签名传参，形参本身不使用是设计
 opts
+
+# pii_scan._CandidateListing.is_file 的 follow_symlinks（#127）：对齐 pathlib.Path 的签名，
+# 守卫只调 is_file()，这个内存载体恒真——形参名不可改（关键字调用），使用它是设计而非死代码
+follow_symlinks

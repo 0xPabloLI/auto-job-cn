@@ -63,15 +63,15 @@ def test_scrub_token_kv_and_bearer():
 
 def test_company_and_hr_names_not_scrubbed():
     """公司名/HR 称谓/岗位名是排障核心字段——triage 拍板严禁脱敏。"""
-    s = "灼识科技 涓女士 RAG 平台工程师（可远程）"
+    s = "灼识科技 白女士 RAG 平台工程师（可远程）"
     assert _lg.scrub_text(s) == s
 
 
 def test_scrub_value_masks_sensitive_keys():
     """字段键是凭证名（token/cookie/authorization 等）→ 整值掩码——结构化日志携带
     凭证的正道（真实冒烟 2026-09-20 踩中：kv 正则只覆盖自由文本，漏掉字段键形态）。"""
-    v = _lg.scrub_value({"token": "abc123", "Cookie": "sid=xyz", "brand": "灼识科技", "contact": "涓女士"})
-    assert v == {"token": "******", "Cookie": "******", "brand": "灼识科技", "contact": "涓女士"}
+    v = _lg.scrub_value({"token": "abc123", "Cookie": "sid=xyz", "brand": "灼识科技", "contact": "白女士"})
+    assert v == {"token": "******", "Cookie": "******", "brand": "灼识科技", "contact": "白女士"}
 
 
 def test_scrub_value_recursive_and_types():
