@@ -3,7 +3,7 @@
 Camoufox 带登录态爬站内 JD。
 - 持久化 user_data_dir 保存登录 cookie
 - 首次运行：打开登录页，等用户手动登录（小号），保存状态
-- 之后运行：带 cookie 爬 JD，规避 code 38
+- 之后运行：带已保存的登录态读取 JD 页面数据；命中 code=38 即登录态失效，重跑 --login
 用法:
   首次: python3 test_camoufox_login.py --login
   爬取: python3 test_camoufox_login.py

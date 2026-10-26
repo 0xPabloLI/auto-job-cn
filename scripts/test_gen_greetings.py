@@ -211,7 +211,7 @@ def test_ai_fingerprint_scan_flags_ai_closing():
     assert mod.ai_fingerprint_scan("简历发您了，期待您的回复。") == ["期待您的回复"]
 
 
-# --- AI 痕迹规避（issue #7 启示 7） ---
+# --- AI 痕迹检测（issue #7 启示 7） ---
 
 
 def test_ai_fingerprint_scan_detects_banned():
